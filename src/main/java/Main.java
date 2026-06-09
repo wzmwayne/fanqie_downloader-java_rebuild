@@ -85,7 +85,7 @@ public class Main {
             System.err.println("用法:");
             System.err.println("  search <关键词>");
             System.err.println("  info <book_id> [--full]");
-            System.err.println("  download <book_id> [-start=N] [-end=N] [--output=txt] [--run=N]");
+            System.err.println("  download <book_id> [-start=N] [-end=N] [--output=txt] [--run=N] [--book-name=NAME]");
             System.exit(1);
         }
 
@@ -232,6 +232,7 @@ public class Main {
         var bookId = args.getFirst();
         int start = 1, end = 0, batchSize = 5;
         boolean outputTxt = false;
+        String cliBookName = null;
 
         for (int i = 1; i < args.size(); i++) {
             var a = args.get(i);
@@ -242,6 +243,7 @@ public class Main {
                 batchSize = Integer.parseInt(a.substring(6));
                 if (batchSize < 1) batchSize = 1;
             }
+            else if (a.startsWith("--book-name=")) cliBookName = a.substring(12);
         }
 
         System.out.println("获取目录...");
@@ -253,13 +255,41 @@ public class Main {
             System.exit(1);
         }
 
-        // fetch book name from reader page of first chapter
+        // fetch book name: CLI override → directory API → reader page → bookId
         String bookName = bookId;
-        if (!chapters.isEmpty()) {
-            try {
-                bookName = fetchBookName(chapters.getFirst().itemId());
-            } catch (Exception ignored) {}
+        if (cliBookName != null) {
+            bookName = cliBookName;
+        } else {
+            var bn = optStr(dData instanceof JsonValue.JsonObject djo2 ? djo2 : null, "bookName");
+            if (!bn.isBlank()) {
+                bookName = bn;
+            } else if (!chapters.isEmpty()) {
+                try {
+                    bookName = fetchBookName(chapters.getFirst().itemId());
+                } catch (Exception ignored) {}
+            }
+            if (bookName.equals(bookId)) {
+                System.out.println("提示: 无法自动获取书名，可用 --book-name=名称 手动指定");
+            }
         }
+
+        // fetch cover image URL from search API
+        ImageInfo coverImage = null;
+        try {
+            var sUrl = SEARCH_URL + "?q=" + URLEncoder.encode(bookId, StandardCharsets.UTF_8) + "&aid=1967";
+            var sJson = fetchJson(sUrl);
+            var sData = sJson instanceof JsonValue.JsonObject sjo ? sjo.map().get("data") : null;
+            var sRet = sData != null ? optArray(sData, "ret_data") : new JsonValue.JsonArray(new ArrayList<>());
+            var match = sRet.list().stream()
+                    .filter(v -> optStr(v, "book_id").equals(bookId))
+                    .findFirst();
+            if (match.isPresent()) {
+                var thumb = optStr(match.get(), "thumb");
+                if (!thumb.isBlank()) {
+                    coverImage = downloadImage(thumb);
+                }
+            }
+        } catch (Exception ignored) {}
 
         int endIdx = end <= 0 ? chapters.size() : Math.min(end, chapters.size());
         int startIdx = Math.max(1, start);
@@ -271,13 +301,7 @@ public class Main {
         int totalChapters = selected.size();
         System.out.println("下载 " + startIdx + " ~ " + endIdx + " 章（共" + totalChapters + "章）");
 
-        // groups of GROUP_SIZE chapters each
-        var groups = new ArrayList<List<Chapter>>();
-        for (int i = 0; i < totalChapters; i += GROUP_SIZE) {
-            groups.add(selected.subList(i, Math.min(i + GROUP_SIZE, totalChapters)));
-        }
-        int totalGroups = groups.size();
-        System.out.println("分组: " + totalGroups + " 组, 每批 " + batchSize + " 组, " + GROUP_SIZE + " 章/组");
+        System.out.println("并发组数: " + batchSize);
 
         var outDir = Path.of("output", bookId);
         Files.createDirectories(outDir);
@@ -292,41 +316,26 @@ public class Main {
         long startTime = System.currentTimeMillis();
         final boolean isTxtOutput = outputTxt;
 
-        // process groups in batches
-        for (int b = 0; b < totalGroups; b += batchSize) {
-            int batchEnd = Math.min(b + batchSize, totalGroups);
-            int poolSize = batchEnd - b;
-            var pool = Executors.newFixedThreadPool(poolSize);
-            var futures = new ArrayList<Future<?>>();
-
-            for (int g = b; g < batchEnd; g++) {
-                var group = groups.get(g);
-                int globalGroupIdx = g;
-                futures.add(pool.submit(() -> {
-                    try {
-                        processGroup(group, globalGroupIdx, isTxtOutput, imageCache, chapterContents, successCount, failCount, totalChapters);
-                    } catch (Exception e) {
-                        System.err.println("\n  组" + (globalGroupIdx + 1) + " 出错: " + e.getMessage());
-                        synchronized (System.out) {
-                            for (int i = 0; i < group.size(); i++) {
-                                var ch = group.get(i);
-                                int idx = globalGroupIdx * GROUP_SIZE + i;
-                                if (idx < totalChapters) {
-                                    chapterContents.put(idx, "");
-                                    failCount.incrementAndGet();
-                                }
-                            }
-                            printProgress(successCount.get(), failCount.get(), totalChapters, startTime);
-                        }
-                    }
-                }));
-            }
-
-            for (var f : futures) {
-                try { f.get(); } catch (Exception ignored) {}
-            }
-            pool.shutdown();
+        // split chapters into groups, submit each group as a task
+        int numGroups = (totalChapters + GROUP_SIZE - 1) / GROUP_SIZE;
+        var pool = Executors.newFixedThreadPool(batchSize);
+        var futures = new ArrayList<Future<?>>();
+        for (int g = 0; g < numGroups; g++) {
+            final int groupIdx = g;
+            int groupStart = g * GROUP_SIZE;
+            int groupEnd = Math.min(groupStart + GROUP_SIZE, totalChapters);
+            var groupChapters = new ArrayList<>(selected.subList(groupStart, groupEnd));
+            futures.add(pool.submit(() -> {
+                downloadGroup(groupIdx, groupChapters, groupStart, startIdx, isTxtOutput,
+                              imageCache, chapterContents, successCount, failCount,
+                              totalChapters, startTime);
+            }));
         }
+
+        for (var f : futures) {
+            try { f.get(); } catch (Exception ignored) {}
+        }
+        pool.shutdown();
 
         // build output
         if (outputTxt) {
@@ -343,7 +352,7 @@ public class Main {
             Files.writeString(outputPath, sb.toString(), StandardCharsets.UTF_8);
         } else {
             System.out.println("\n生成 EPUB...");
-            generateEpub(outputPath.toString(), bookId, bookName, selected, chapterContents, imageCache, totalChapters);
+            generateEpub(outputPath.toString(), bookId, bookName, selected, chapterContents, imageCache, coverImage, totalChapters);
         }
 
         long elapsed = (System.currentTimeMillis() - startTime) / 1000;
@@ -358,62 +367,61 @@ public class Main {
         }
     }
 
-    static void processGroup(List<Chapter> group, int globalGroupIdx, boolean outputTxt,
-                              ConcurrentHashMap<String, ImageInfo> imageCache,
-                              ConcurrentHashMap<Integer, String> chapterContents,
-                              AtomicInteger successCount, AtomicInteger failCount,
-                              int totalChapters) {
-        for (int i = 0; i < group.size(); i++) {
-            var ch = group.get(i);
-            int idx = globalGroupIdx * GROUP_SIZE + i;
-
-            String content = null;
-            for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
-                try {
-                    if (outputTxt) {
-                        content = fetchChapterContentTxt(ch.itemId);
-                    } else {
-                        content = fetchChapterContentEpub(ch.itemId, imageCache);
-                    }
-                    if (content != null && !content.isBlank() && !isErrorContent(content)) {
-                        break;
-                    }
-                    content = null;
-                } catch (Exception e) {
-                    content = null;
-                }
-                if (attempt < MAX_RETRIES - 1) {
-                    synchronized (System.out) {
-                        System.out.println("\n  重试 " + ch.title() + " (" + (attempt + 1) + "/" + MAX_RETRIES + ")");
-                    }
-                    try { Thread.sleep(2000L * (attempt + 1)); } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
-                        break;
-                    }
-                }
-            }
-
-            chapterContents.put(idx, content != null ? content : "");
-            if (content != null && !content.isEmpty()) {
-                successCount.incrementAndGet();
-            } else {
-                failCount.incrementAndGet();
-            }
-            synchronized (System.out) {
-                printProgress(successCount.get(), failCount.get(), totalChapters, System.currentTimeMillis());
-            }
+    static void downloadGroup(int groupIdx, List<Chapter> chapters, int offset, int startChapter,
+                               boolean outputTxt, ConcurrentHashMap<String, ImageInfo> imageCache,
+                               ConcurrentHashMap<Integer, String> chapterContents,
+                               AtomicInteger successCount, AtomicInteger failCount,
+                               int totalChapters, long startTime) {
+        int a = startChapter + offset;
+        int b = startChapter + offset + chapters.size() - 1;
+        synchronized (System.out) {
+            System.out.println("第 " + (groupIdx + 1) + " 组 (第 " + a + "-" + b + " 章): 开始下载");
+        }
+        for (int i = 0; i < chapters.size(); i++) {
+            downloadOneChapter(chapters.get(i), offset + i, outputTxt, imageCache,
+                               chapterContents, successCount, failCount);
+        }
+        synchronized (System.out) {
+            System.out.println("第 " + (groupIdx + 1) + " 组 (第 " + a + "-" + b + " 章): 结束下载");
         }
     }
 
-    static synchronized void printProgress(int success, int fail, int total, long startTime) {
-        int done = success + fail;
-        long elapsed = (System.currentTimeMillis() - startTime) / 1000;
-        if (total > 0) {
-            System.out.printf("\r  进度: %d/%d 完成, %d 失败, 用时 %ds", done, total, fail, elapsed);
-        } else {
-            System.out.printf("\r  进度: %d 成功, %d 失败, 用时 %ds", success, fail, elapsed);
+    static void downloadOneChapter(Chapter ch, int idx, boolean outputTxt,
+                                     ConcurrentHashMap<String, ImageInfo> imageCache,
+                                     ConcurrentHashMap<Integer, String> chapterContents,
+                                     AtomicInteger successCount, AtomicInteger failCount) {
+        String content = null;
+        for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+            try {
+                if (outputTxt) {
+                    content = fetchChapterContentTxt(ch.itemId);
+                } else {
+                    content = fetchChapterContentEpub(ch.itemId, imageCache);
+                }
+                if (content != null && !content.isBlank() && !isErrorContent(content)) {
+                    break;
+                }
+                content = null;
+            } catch (Exception e) {
+                content = null;
+            }
+            if (attempt < MAX_RETRIES - 1) {
+                synchronized (System.out) {
+                    System.out.println("\n  重试 " + ch.title() + " (" + (attempt + 1) + "/" + MAX_RETRIES + ")");
+                }
+                try { Thread.sleep(2000L * (attempt + 1)); } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
         }
-        System.out.flush();
+
+        chapterContents.put(idx, content != null ? content : "");
+        if (content != null && !content.isEmpty()) {
+            successCount.incrementAndGet();
+        } else {
+            failCount.incrementAndGet();
+        }
     }
 
     // ── Content extraction (TXT path) ───────────────────
@@ -576,6 +584,27 @@ public class Main {
         return sb.toString();
     }
 
+    static ImageInfo downloadImage(String url) {
+        if (!url.startsWith("http://") && !url.startsWith("https://")) return null;
+        try {
+            var req = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .header("User-Agent", UA)
+                    .GET()
+                    .timeout(Duration.ofSeconds(10))
+                    .build();
+            var resp = client.send(req, HttpResponse.BodyHandlers.ofByteArray());
+            if (resp.statusCode() == 200) {
+                byte[] data = resp.body();
+                var mimeAndExt = sniffMime(data);
+                if (mimeAndExt[0].equals("application/octet-stream")) return null;
+                String hash = sha1Hex(url);
+                return new ImageInfo(data, mimeAndExt[0], "images/" + hash + mimeAndExt[1]);
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
+
     static String downloadAndCacheImage(String url, ConcurrentHashMap<String, ImageInfo> cache) {
         var existing = cache.get(url);
         if (existing != null) return existing.filename();
@@ -626,6 +655,7 @@ public class Main {
     static void generateEpub(String outputPath, String bookId, String bookName, List<Chapter> chapters,
                               ConcurrentHashMap<Integer, String> contents,
                               ConcurrentHashMap<String, ImageInfo> imageCache,
+                              ImageInfo coverImage,
                               int totalChapters) throws Exception {
 
         try (var fos = Files.newOutputStream(Path.of(outputPath));
@@ -655,7 +685,25 @@ public class Main {
             zos.write(getCss().getBytes(StandardCharsets.UTF_8));
             zos.closeEntry();
 
-            // 4. Chapter XHTML files
+            // 4. Cover
+            String coverImageId = null;
+            String coverHref = null;
+            if (coverImage != null) {
+                coverHref = "cover.xhtml";
+                var coverXhtml = buildCoverXhtml(bookName, coverImage.filename());
+                zos.putNextEntry(new ZipEntry("OEBPS/" + coverHref));
+                zos.write(coverXhtml.getBytes(StandardCharsets.UTF_8));
+                zos.closeEntry();
+                // write cover image
+                zos.putNextEntry(new ZipEntry("OEBPS/" + coverImage.filename()));
+                zos.write(coverImage.data());
+                zos.closeEntry();
+                coverImageId = "cover-image";
+                // add cover image to imageCache so buildOpfXml includes it
+                imageCache.putIfAbsent("__cover__", coverImage);
+            }
+
+            // 5. Chapter XHTML files
             var itemIds = new ArrayList<String>();
             for (int i = 0; i < totalChapters; i++) {
                 var ch = i < chapters.size() ? chapters.get(i) : null;
@@ -679,7 +727,7 @@ public class Main {
 
             // 6. content.opf
             zos.putNextEntry(new ZipEntry("OEBPS/content.opf"));
-            zos.write(buildOpfXml(bookId, bookName, chapters, imageCache, itemIds, totalChapters)
+            zos.write(buildOpfXml(bookId, bookName, chapters, imageCache, itemIds, coverHref, totalChapters)
                      .getBytes(StandardCharsets.UTF_8));
             zos.closeEntry();
 
@@ -702,7 +750,8 @@ public class Main {
 
     static String buildOpfXml(String bookId, String bookName, List<Chapter> chapters,
                                ConcurrentHashMap<String, ImageInfo> imageCache,
-                               List<String> itemIds, int totalChapters) {
+                               List<String> itemIds, String coverHref,
+                               int totalChapters) {
         var sb = new StringBuilder();
         sb.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
         sb.append("<package xmlns=\"http://www.idpf.org/2007/opf\" version=\"2.0\" unique-identifier=\"BookId\">\n");
@@ -710,11 +759,19 @@ public class Main {
         sb.append("    <dc:identifier id=\"BookId\">").append(xmlEscape(bookId)).append("</dc:identifier>\n");
         sb.append("    <dc:title>").append(xmlEscape(bookName)).append("</dc:title>\n");
         sb.append("    <dc:language>zh</dc:language>\n");
+        if (coverHref != null) {
+            sb.append("    <meta name=\"cover\" content=\"cover-image\"/>\n");
+        }
         sb.append("  </metadata>\n");
 
         sb.append("  <manifest>\n");
         sb.append("    <item id=\"ncx\" href=\"toc.ncx\" media-type=\"application/x-dtbncx+xml\"/>\n");
         sb.append("    <item id=\"css\" href=\"stylesheet.css\" media-type=\"text/css\"/>\n");
+        if (coverHref != null) {
+            sb.append("    <item id=\"cover\" href=\"")
+              .append(coverHref)
+              .append("\" media-type=\"application/xhtml+xml\"/>\n");
+        }
 
         for (int i = 0; i < totalChapters; i++) {
             String fid = itemIds.get(i);
@@ -728,8 +785,10 @@ public class Main {
         int imgIdx = 0;
         for (var entry : imageCache.entrySet()) {
             var info = entry.getValue();
-            sb.append("    <item id=\"img_")
-              .append(String.format("%04d", imgIdx++))
+            var id = entry.getKey().equals("__cover__") ? "cover-image"
+                     : String.format("img_%04d", imgIdx++);
+            sb.append("    <item id=\"")
+              .append(id)
               .append("\" href=\"")
               .append(info.filename())
               .append("\" media-type=\"")
@@ -740,6 +799,9 @@ public class Main {
         sb.append("  </manifest>\n");
 
         sb.append("  <spine toc=\"ncx\">\n");
+        if (coverHref != null) {
+            sb.append("    <itemref idref=\"cover\"/>\n");
+        }
         for (int i = 0; i < totalChapters; i++) {
             sb.append("    <itemref idref=\"ch_")
               .append(String.format("%05d", i + 1))
@@ -803,6 +865,19 @@ public class Main {
              + "<h1>" + escapedTitle + "</h1>\n"
              + "<div class=\"content\">\n"
              + wrapped + "\n"
+             + "</div>\n"
+             + "</body>\n</html>\n";
+    }
+
+    static String buildCoverXhtml(String bookName, String imagePath) {
+        return "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+             + "<!DOCTYPE html>\n"
+             + "<html xmlns=\"http://www.w3.org/1999/xhtml\" lang=\"zh\" xml:lang=\"zh\">\n"
+             + "<head><title>" + xmlEscape(bookName) + "</title>\n"
+             + "<link href=\"stylesheet.css\" rel=\"stylesheet\" type=\"text/css\"/></head>\n"
+             + "<body>\n"
+             + "<div style=\"text-align:center;padding:2em;\">\n"
+             + "<img src=\"" + xmlEscape(imagePath) + "\" alt=\"Cover\" style=\"max-width:100%;height:auto;\"/>\n"
              + "</div>\n"
              + "</body>\n</html>\n";
     }
