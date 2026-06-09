@@ -1,7 +1,34 @@
 import java.util.*;
 
 sealed interface JsonValue {
-    record JsonObject(Map<String, JsonValue> map) implements JsonValue {}
+    record JsonObject(Map<String, JsonValue> map) implements JsonValue {
+        public JsonValue get(String key) { return map.get(key); }
+        public JsonObject obj(String key) { return map.get(key) instanceof JsonObject o ? o : null; }
+        public String str(String key) {
+            var v = map.get(key);
+            return v instanceof JsonString s ? s.value() : null;
+        }
+        public String str(String key, String def) {
+            var s = str(key);
+            return s != null ? s : def;
+        }
+        public int integer(String key, int def) {
+            var v = map.get(key);
+            return v instanceof JsonNumber n ? n.intValue() : def;
+        }
+        public long longv(String key, long def) {
+            var v = map.get(key);
+            return v instanceof JsonNumber n ? n.longValue() : def;
+        }
+        public List<JsonValue> arr(String key) {
+            var v = map.get(key);
+            return v instanceof JsonArray a ? a.list() : List.of();
+        }
+        public boolean bool(String key, boolean def) {
+            var v = map.get(key);
+            return v instanceof JsonBoolean b ? b.value() : def;
+        }
+    }
     record JsonArray(List<JsonValue> list) implements JsonValue {}
     record JsonString(String value) implements JsonValue {}
     record JsonNumber(double value) implements JsonValue {
@@ -188,8 +215,8 @@ class JsonParser {
     // --- convenience helpers ---
     static String optString(JsonValue val, String key) {
         if (val instanceof JsonValue.JsonObject obj) {
-            JsonValue v = obj.map().get(key);
-            if (v instanceof JsonValue.JsonString s) return s.value();
+            var s = obj.str(key);
+            return s != null ? s : "";
         }
         return "";
     }
@@ -201,9 +228,8 @@ class JsonParser {
 
     static JsonValue.JsonArray optArray(JsonValue val, String key) {
         if (val instanceof JsonValue.JsonObject obj) {
-            JsonValue v = obj.map().get(key);
-            if (v instanceof JsonValue.JsonArray a) return a;
+            return new JsonValue.JsonArray(new ArrayList<>(obj.arr(key)));
         }
-        return new JsonValue.JsonArray(List.of());
+        return new JsonValue.JsonArray(new ArrayList<>());
     }
 }

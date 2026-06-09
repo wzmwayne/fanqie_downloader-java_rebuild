@@ -1,3 +1,4 @@
+import java.io.IOException;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
@@ -8,7 +9,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.time.Duration;
-import java.util.regex.Pattern;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -76,6 +76,8 @@ public class Main {
         "<img[^>]*\\bsrc\\s*=\\s*['\"]([^'\"]+)['\"][^>]*>", Pattern.CASE_INSENSITIVE
     );
 
+    static final Path CACHE_DIR = Path.of("cache");
+
     record Chapter(String itemId, String title, int order) {}
     record BookInfo(String bookId, String title, String author, String category, String score, String desc) {}
     record ImageInfo(byte[] data, String mime, String filename) {}
@@ -85,7 +87,7 @@ public class Main {
             System.err.println("用法:");
             System.err.println("  search <关键词>");
             System.err.println("  info <book_id> [--full]");
-            System.err.println("  download <book_id> [-start=N] [-end=N] [--output=txt] [--run=N] [--book-name=NAME]");
+            System.err.println("  download <book_id> [-start=N] [-end=N] [--output=txt] [--run=N] [--book-name=NAME] [--redownload=true|false]");
             System.exit(1);
         }
 
@@ -234,6 +236,8 @@ public class Main {
         boolean outputTxt = false;
         String cliBookName = null;
 
+        boolean redownload = false;
+        boolean redownloadExplicit = false;
         for (int i = 1; i < args.size(); i++) {
             var a = args.get(i);
             if (a.startsWith("-start=")) start = Integer.parseInt(a.substring(7));
@@ -244,6 +248,10 @@ public class Main {
                 if (batchSize < 1) batchSize = 1;
             }
             else if (a.startsWith("--book-name=")) cliBookName = a.substring(12);
+            else if (a.startsWith("--redownload=")) {
+                redownload = a.substring(13).equals("true");
+                redownloadExplicit = true;
+            }
         }
 
         System.out.println("获取目录...");
@@ -273,23 +281,32 @@ public class Main {
             }
         }
 
-        // fetch cover image URL from search API
+        // fetch cover image: /page/{bookId} HTML → __INITIAL_STATE__.page.thumbUrl
         ImageInfo coverImage = null;
         try {
-            var sUrl = SEARCH_URL + "?q=" + URLEncoder.encode(bookId, StandardCharsets.UTF_8) + "&aid=1967";
-            var sJson = fetchJson(sUrl);
-            var sData = sJson instanceof JsonValue.JsonObject sjo ? sjo.map().get("data") : null;
-            var sRet = sData != null ? optArray(sData, "ret_data") : new JsonValue.JsonArray(new ArrayList<>());
-            var match = sRet.list().stream()
-                    .filter(v -> optStr(v, "book_id").equals(bookId))
-                    .findFirst();
-            if (match.isPresent()) {
-                var thumb = optStr(match.get(), "thumb");
-                if (!thumb.isBlank()) {
-                    coverImage = downloadImage(thumb);
-                }
+            var coverUrl = fetchCoverUrl(bookId);
+            if (coverUrl != null) {
+                coverImage = downloadImage(coverUrl);
             }
         } catch (Exception ignored) {}
+        // fallback: search API thumb
+        if (coverImage == null) {
+            try {
+                var sUrl = SEARCH_URL + "?q=" + URLEncoder.encode(bookId, StandardCharsets.UTF_8) + "&aid=1967";
+                var sJson = fetchJson(sUrl);
+                var sData = sJson instanceof JsonValue.JsonObject sjo ? sjo.map().get("data") : null;
+                var sRet = sData != null ? optArray(sData, "ret_data") : new JsonValue.JsonArray(new ArrayList<>());
+                var match = sRet.list().stream()
+                        .filter(v -> optStr(v, "book_id").equals(bookId))
+                        .findFirst();
+                if (match.isPresent()) {
+                    var thumb = optStr(match.get(), "thumb");
+                    if (!thumb.isBlank()) {
+                        coverImage = downloadImage(thumb);
+                    }
+                }
+            } catch (Exception ignored) {}
+        }
 
         int endIdx = end <= 0 ? chapters.size() : Math.min(end, chapters.size());
         int startIdx = Math.max(1, start);
@@ -301,12 +318,29 @@ public class Main {
         int totalChapters = selected.size();
         System.out.println("下载 " + startIdx + " ~ " + endIdx + " 章（共" + totalChapters + "章）");
 
-        System.out.println("并发组数: " + batchSize);
-
         var outDir = Path.of("output", bookId);
         Files.createDirectories(outDir);
         var ext = outputTxt ? ".txt" : ".epub";
         var outputPath = outDir.resolve(bookId + "_" + startIdx + "-" + endIdx + ext);
+
+        // ----- Check cache -----
+        var cacheDir = CACHE_DIR.resolve(bookId);
+        boolean hasCache = Files.exists(cacheDir.resolve("meta.json"));
+
+        if (hasCache && !redownload) {
+            System.out.println("检测到缓存，使用 --redownload=true 重新下载，--redownload=false 使用缓存");
+            System.out.println("（当前: 使用缓存）");
+            generateFromCache(outputPath.toString(), bookId, outputTxt, bookName, selected, totalChapters);
+            System.out.println("已保存: " + outputPath.toAbsolutePath());
+            return;
+        }
+        if (hasCache && redownload) {
+            System.out.println("重新下载（--redownload=true），删除缓存...");
+            deleteDirectory(cacheDir);
+        }
+
+        // ----- Download -----
+        System.out.println("并发组数: " + batchSize);
 
         var chapterContents = new ConcurrentHashMap<Integer, String>();
         var imageCache = new ConcurrentHashMap<String, ImageInfo>();
@@ -316,7 +350,6 @@ public class Main {
         long startTime = System.currentTimeMillis();
         final boolean isTxtOutput = outputTxt;
 
-        // split chapters into groups, submit each group as a task
         int numGroups = (totalChapters + GROUP_SIZE - 1) / GROUP_SIZE;
         var pool = Executors.newFixedThreadPool(batchSize);
         var futures = new ArrayList<Future<?>>();
@@ -337,26 +370,14 @@ public class Main {
         }
         pool.shutdown();
 
-        // build output
-        if (outputTxt) {
-            var sb = new StringBuilder();
-            for (int i = 0; i < totalChapters; i++) {
-                var content = chapterContents.get(i);
-                if (content != null && !content.isBlank()) {
-                    sb.append(selected.get(i).title()).append("\n\n");
-                    sb.append(content).append("\n\n\n");
-                } else {
-                    sb.append(selected.get(i).title()).append("\n\n[获取失败]\n\n\n");
-                }
-            }
-            Files.writeString(outputPath, sb.toString(), StandardCharsets.UTF_8);
-        } else {
-            System.out.println("\n生成 EPUB...");
-            generateEpub(outputPath.toString(), bookId, bookName, selected, chapterContents, imageCache, coverImage, totalChapters);
-        }
-
         long elapsed = (System.currentTimeMillis() - startTime) / 1000;
-        System.out.println("\n完成: " + successCount.get() + " 成功, " + failCount.get() + " 失败, 用时 " + elapsed + "s");
+        System.out.println("\n下载完成: " + successCount.get() + " 成功, " + failCount.get() + " 失败, 用时 " + elapsed + "s");
+
+        // save cache
+        saveDownloadCache(bookId, bookName, selected, startIdx, endIdx, chapterContents, imageCache, coverImage);
+
+        // generate output from cache
+        generateFromCache(outputPath.toString(), bookId, outputTxt, bookName, selected, totalChapters);
         System.out.println("已保存: " + outputPath.toAbsolutePath());
 
         // clean temp files
@@ -717,7 +738,13 @@ public class Main {
                 itemIds.add(fid);
             }
 
-            // 5. Images
+            // 6. TOC XHTML (visible table of contents)
+            String tocHref = "toc.xhtml";
+            zos.putNextEntry(new ZipEntry("OEBPS/" + tocHref));
+            zos.write(buildTocXhtml(bookName, chapters, totalChapters).getBytes(StandardCharsets.UTF_8));
+            zos.closeEntry();
+
+            // 7. Images
             for (var entry : imageCache.entrySet()) {
                 var info = entry.getValue();
                 zos.putNextEntry(new ZipEntry("OEBPS/" + info.filename()));
@@ -725,13 +752,13 @@ public class Main {
                 zos.closeEntry();
             }
 
-            // 6. content.opf
+            // 8. content.opf
             zos.putNextEntry(new ZipEntry("OEBPS/content.opf"));
-            zos.write(buildOpfXml(bookId, bookName, chapters, imageCache, itemIds, coverHref, totalChapters)
+            zos.write(buildOpfXml(bookId, bookName, chapters, imageCache, itemIds, coverHref, tocHref, totalChapters)
                      .getBytes(StandardCharsets.UTF_8));
             zos.closeEntry();
 
-            // 7. toc.ncx
+            // 9. toc.ncx
             zos.putNextEntry(new ZipEntry("OEBPS/toc.ncx"));
             zos.write(buildNcxXml(bookId, bookName, chapters, itemIds, totalChapters)
                      .getBytes(StandardCharsets.UTF_8));
@@ -750,7 +777,7 @@ public class Main {
 
     static String buildOpfXml(String bookId, String bookName, List<Chapter> chapters,
                                ConcurrentHashMap<String, ImageInfo> imageCache,
-                               List<String> itemIds, String coverHref,
+                               List<String> itemIds, String coverHref, String tocHref,
                                int totalChapters) {
         var sb = new StringBuilder();
         sb.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
@@ -770,6 +797,11 @@ public class Main {
         if (coverHref != null) {
             sb.append("    <item id=\"cover\" href=\"")
               .append(coverHref)
+              .append("\" media-type=\"application/xhtml+xml\"/>\n");
+        }
+        if (tocHref != null) {
+            sb.append("    <item id=\"toc\" href=\"")
+              .append(tocHref)
               .append("\" media-type=\"application/xhtml+xml\"/>\n");
         }
 
@@ -801,6 +833,9 @@ public class Main {
         sb.append("  <spine toc=\"ncx\">\n");
         if (coverHref != null) {
             sb.append("    <itemref idref=\"cover\"/>\n");
+        }
+        if (tocHref != null) {
+            sb.append("    <itemref idref=\"toc\"/>\n");
         }
         for (int i = 0; i < totalChapters; i++) {
             sb.append("    <itemref idref=\"ch_")
@@ -869,6 +904,28 @@ public class Main {
              + "</body>\n</html>\n";
     }
 
+    static String buildTocXhtml(String bookName, List<Chapter> chapters, int totalChapters) {
+        var ol = new StringBuilder();
+        for (int i = 0; i < totalChapters; i++) {
+            var ch = i < chapters.size() ? chapters.get(i) : null;
+            String title = ch != null ? ch.title() : "章节" + (i + 1);
+            String fid = String.format("chapter_%05d.xhtml", i + 1);
+            ol.append("<li><a href=\"").append(fid).append("\">")
+              .append(xmlEscape(title)).append("</a></li>\n");
+        }
+        return "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+             + "<!DOCTYPE html>\n"
+             + "<html xmlns=\"http://www.w3.org/1999/xhtml\" lang=\"zh\" xml:lang=\"zh\">\n"
+             + "<head><title>" + xmlEscape(bookName) + " - 目录</title>\n"
+             + "<link href=\"stylesheet.css\" rel=\"stylesheet\" type=\"text/css\"/></head>\n"
+             + "<body>\n"
+             + "<h1>目录</h1>\n"
+             + "<div class=\"content\">\n"
+             + "<ol>\n" + ol + "</ol>\n"
+             + "</div>\n"
+             + "</body>\n</html>\n";
+    }
+
     static String buildCoverXhtml(String bookName, String imagePath) {
         return "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
              + "<!DOCTYPE html>\n"
@@ -918,6 +975,19 @@ public class Main {
         return new JsonParser(resp.body()).parse();
     }
 
+    static String fetchCoverUrl(String bookId) throws Exception {
+        var html = fetchHtml("https://fanqienovel.com/page/" + bookId);
+        // __INITIAL_STATE__.page.thumbUrl
+        var m = Pattern.compile("\"thumbUrl\"\\s*:\\s*\"([^\"]+)\"").matcher(html);
+        if (m.find()) {
+            var url = m.group(1);
+            // unescape JSON unicode sequences
+            url = url.replace("\\u0026", "&").replace("\\u002F", "/");
+            return url;
+        }
+        return null;
+    }
+
     static String optStr(JsonValue val, String key) {
         if (val instanceof JsonValue.JsonObject obj) {
             var v = obj.map().get(key);
@@ -963,6 +1033,182 @@ public class Main {
             return sb.toString();
         } catch (Exception e) {
             return Integer.toHexString(input.hashCode());
+        }
+    }
+
+    static void deleteDirectory(Path dir) throws IOException {
+        if (Files.exists(dir)) {
+            try (var files = Files.walk(dir)) {
+                files.sorted(Comparator.reverseOrder())
+                     .forEach(p -> { try { Files.deleteIfExists(p); } catch (Exception ignored) {} });
+            }
+        }
+    }
+
+    static String jsonEscape(String s) {
+        return s.replace("\\", "\\\\").replace("\"", "\\\"")
+                .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t");
+    }
+
+    static void saveDownloadCache(String bookId, String bookName,
+                                   List<Chapter> chapters,
+                                   int startIdx, int endIdx,
+                                   ConcurrentHashMap<Integer, String> chapterContents,
+                                   ConcurrentHashMap<String, ImageInfo> imageCache,
+                                   ImageInfo coverImage) throws IOException {
+        var dir = CACHE_DIR.resolve(bookId);
+        deleteDirectory(dir);
+        Files.createDirectories(dir);
+
+        // meta.json
+        var meta = "{\n"
+            + "  \"bookName\": \"" + jsonEscape(bookName) + "\",\n"
+            + "  \"startIdx\": " + startIdx + ",\n"
+            + "  \"endIdx\": " + endIdx + ",\n"
+            + "  \"totalChapters\": " + chapters.size() + ",\n"
+            + "  \"chapters\": [\n";
+        for (int i = 0; i < chapters.size(); i++) {
+            var ch = chapters.get(i);
+            meta += "    {\"itemId\":\"" + jsonEscape(ch.itemId())
+                 + "\",\"title\":\"" + jsonEscape(ch.title())
+                 + "\",\"order\":" + ch.order() + "}";
+            if (i < chapters.size() - 1) meta += ",";
+            meta += "\n";
+        }
+        meta += "  ]\n";
+        if (coverImage != null) {
+            meta += "  ,\"cover\":\"" + jsonEscape(coverImage.filename()) + "\"\n"
+                  + "  ,\"coverMime\":\"" + jsonEscape(coverImage.mime()) + "\"\n";
+        }
+        meta += "}\n";
+        Files.writeString(dir.resolve("meta.json"), meta, StandardCharsets.UTF_8);
+
+        // chapters
+        var chDir = dir.resolve("chapters");
+        Files.createDirectories(chDir);
+        for (int i = 0; i < chapters.size(); i++) {
+            var content = chapterContents.get(i);
+            if (content != null && !content.isEmpty()) {
+                Files.writeString(chDir.resolve(String.valueOf(i)), content, StandardCharsets.UTF_8);
+            }
+        }
+
+        // images
+        var imgDir = dir.resolve("images");
+        Files.createDirectories(imgDir);
+        for (var entry : imageCache.entrySet()) {
+            var info = entry.getValue();
+            var fname = info.filename().replace("images/", "");
+            Files.write(imgDir.resolve(fname), info.data());
+        }
+
+        // cover
+        if (coverImage != null) {
+            var fname = coverImage.filename().replace("images/", "");
+            Files.write(dir.resolve("cover"), coverImage.data());
+        }
+
+        System.out.println("缓存已保存: " + dir.toAbsolutePath());
+    }
+
+    static List<Chapter> loadChaptersFromCache(String bookId) throws IOException {
+        var dir = CACHE_DIR.resolve(bookId);
+        var metaStr = Files.readString(dir.resolve("meta.json"), StandardCharsets.UTF_8);
+        var parsed = new JsonParser(metaStr).parse();
+        if (!(parsed instanceof JsonValue.JsonObject jo)) throw new IOException("meta.json格式错误");
+        var chapters = new ArrayList<Chapter>();
+        for (var v : jo.arr("chapters")) {
+            if (v instanceof JsonValue.JsonObject ch) {
+                chapters.add(new Chapter(
+                    ch.str("itemId", ""),
+                    ch.str("title", ""),
+                    ch.integer("order", 0)
+                ));
+            }
+        }
+        return chapters;
+    }
+
+    static void generateFromCache(String outputPath, String bookId, boolean outputTxt,
+                                   String bookName, List<Chapter> selected,
+                                   int totalChapters) throws Exception {
+        var dir = CACHE_DIR.resolve(bookId);
+        var metaStr = Files.readString(dir.resolve("meta.json"), StandardCharsets.UTF_8);
+        var parsed = new JsonParser(metaStr).parse();
+        if (!(parsed instanceof JsonValue.JsonObject jo)) throw new IOException("meta.json格式错误");
+
+        // Load chapter contents
+        var chapterContents = new ConcurrentHashMap<Integer, String>();
+        var chDir = dir.resolve("chapters");
+        if (Files.exists(chDir)) {
+            try (var files = Files.list(chDir)) {
+                files.forEach(p -> {
+                    var name = p.getFileName().toString();
+                    try {
+                        var idx = Integer.parseInt(name);
+                        var content = Files.readString(p, StandardCharsets.UTF_8);
+                        chapterContents.put(idx, content);
+                    } catch (Exception ignored) {}
+                });
+            }
+        }
+
+        // Load images
+        var imageCache = new ConcurrentHashMap<String, ImageInfo>();
+        var imgDir = dir.resolve("images");
+        if (Files.exists(imgDir)) {
+            try (var files = Files.list(imgDir)) {
+                files.forEach(p -> {
+                    try {
+                        var data = Files.readAllBytes(p);
+                        var mimeAndExt = sniffMime(data);
+                        if (!mimeAndExt[0].equals("application/octet-stream")) {
+                            var filename = "images/" + p.getFileName().toString();
+                            imageCache.put(filename, new ImageInfo(data, mimeAndExt[0], filename));
+                        }
+                    } catch (Exception ignored) {}
+                });
+            }
+        }
+
+        // Load cover
+        ImageInfo coverImage = null;
+        var coverFile = dir.resolve("cover");
+        if (Files.exists(coverFile)) {
+            var data = Files.readAllBytes(coverFile);
+            var mimeAndExt = sniffMime(data);
+            if (!mimeAndExt[0].equals("application/octet-stream")) {
+                var filename = "images/cover" + mimeAndExt[1];
+                coverImage = new ImageInfo(data, mimeAndExt[0], filename);
+                imageCache.put("__cover__", coverImage);
+            }
+        }
+
+        // Generate output
+        generateOutput(outputPath, bookId, bookName, selected, totalChapters, outputTxt,
+                       chapterContents, imageCache, coverImage);
+    }
+
+    static void generateOutput(String outputPath, String bookId, String bookName,
+                                List<Chapter> selected, int totalChapters, boolean outputTxt,
+                                ConcurrentHashMap<Integer, String> chapterContents,
+                                ConcurrentHashMap<String, ImageInfo> imageCache,
+                                ImageInfo coverImage) throws Exception {
+        if (outputTxt) {
+            var sb = new StringBuilder();
+            for (int i = 0; i < totalChapters; i++) {
+                var content = chapterContents.get(i);
+                if (content != null && !content.isBlank()) {
+                    sb.append(selected.get(i).title()).append("\n\n");
+                    sb.append(content).append("\n\n\n");
+                } else {
+                    sb.append(selected.get(i).title()).append("\n\n[获取失败]\n\n\n");
+                }
+            }
+            Files.writeString(Path.of(outputPath), sb.toString(), StandardCharsets.UTF_8);
+        } else {
+            System.out.println("\n生成 EPUB...");
+            generateEpub(outputPath, bookId, bookName, selected, chapterContents, imageCache, coverImage, totalChapters);
         }
     }
 
