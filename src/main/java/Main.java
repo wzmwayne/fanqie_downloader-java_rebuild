@@ -1,5 +1,12 @@
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.PrintStream;
+import java.net.HttpURLConnection;
 import java.net.URI;
+import java.net.URL;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -15,8 +22,13 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.zip.CRC32;
+import java.util.zip.GZIPInputStream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
+
+import com.anjia.unidbgserver.unidbg.IdleFQ;
+import com.anjia.unidbgserver.service.FqCrypto;
+import com.anjia.unidbgserver.dto.FqVariable;
 
 public class Main {
 
@@ -28,47 +40,18 @@ public class Main {
             .followRedirects(HttpClient.Redirect.NORMAL)
             .build();
 
-    static final int CHAR_BASE = 0xE3E8;
-    static final char[] CHARSET = {
-        'D','在','主','特','家','军','然','表','场','4',
-        '要','只','v','和','?','6','别','还','g','现',
-        '儿','岁','?','?','此','象','月','3','出','战',
-        '工','相','o','男','直','失','世','F','都','平',
-        '文','什','V','O','将','真','T','那','当','?',
-        '会','立','些','u','是','十','张','学','气','大',
-        '爱','两','命','全','后','东','性','通','被','1',
-        '它','乐','接','而','感','车','山','公','了','常',
-        '以','何','可','话','先','p','i','叫','轻','M',
-        '士','w','着','变','尔','快','l','个','说','少',
-        '色','里','安','花','远','7','难','师','放','t',
-        '报','认','面','道','S','?','克','地','度','I',
-        '好','机','U','民','写','把','万','同','水','新',
-        '没','书','电','吃','像','斯','5','为','y','白',
-        '几','日','教','看','但','第','加','候','作','上',
-        '拉','住','有','法','r','事','应','位','利','你',
-        '声','身','国','问','马','女','他','Y','比','父',
-        'x','A','H','N','s','X','边','美','对','所',
-        '金','活','回','意','到','z','从','j','知','又',
-        '内','因','点','Q','三','定','8','R','b','正',
-        '或','夫','向','德','听','更','?','得','告','并',
-        '本','q','过','记','L','让','打','f','人','就',
-        '者','去','原','满','体','做','经','K','走','如',
-        '孩','c','G','给','使','物','?','最','笑','部',
-        '?','员','等','受','k','行','一','条','果','动',
-        '光','门','头','见','往','自','解','成','处','天',
-        '能','于','名','其','发','总','母','的','死','手',
-        '入','路','进','心','来','h','时','力','多','开',
-        '已','许','d','至','由','很','界','n','小','与',
-        'Z','想','代','么','分','生','口','再','妈','望',
-        '次','西','风','种','带','J','?','实','情','才',
-        '这','?','E','我','神','格','长','觉','间','年',
-        '眼','无','不','亲','关','结','0','友','信','下',
-        '却','重','己','老','2','音','字','m','呢','明',
-        '之','前','高','P','B','目','太','e','9','起',
-        '稜','她','也','W','用','方','子','英','每','理',
-        '便','四','数','期','中','C','外','样','a','海',
-        '们','任'
-    };
+    // FQ signed API
+    static final String FQ_BASE_URL = "https://api5-normal-sinfonlineb.fqnovel.com";
+    static final String FQ_UA_BASE = "com.dragon.read.oversea.gp/68132 (Linux; U; Android 10; zh_CN; OnePlus11; Build/V291IR;tt-ok/3.12.13.4-tiktok)";
+    static String FQ_UA = FQ_UA_BASE;
+    static String FQ_COOKIE = "store-region=cn-zj; store-region-src=did; install_id=933935730456617";
+    static IdleFQ idleFQ;
+    static String decryptKey;
+
+    static String deviceId = "933935730452521";
+    static String installId = "933935730456617";
+    static String deviceCdid = "17f05006-423a-4172-be4b-7d26a42f2f4a";
+    static boolean verbose;
 
     static final int GROUP_SIZE = 10;
     static final int MAX_RETRIES = 3;
@@ -151,64 +134,117 @@ public class Main {
         var bookId = args.getFirst();
         boolean showFull = args.contains("--full");
 
-        var sUrl = SEARCH_URL + "?q=" + URLEncoder.encode(bookId, StandardCharsets.UTF_8) + "&aid=1967";
-        var sJson = fetchJson(sUrl);
-        var sData = sJson instanceof JsonValue.JsonObject jo ? jo.map().get("data") : null;
-        var sRet = sData != null ? optArray(sData, "ret_data") : new JsonValue.JsonArray(new ArrayList<>());
-        var match = sRet.list().stream()
-                .filter(v -> optStr(v, "book_id").equals(bookId))
-                .findFirst();
-        if (match.isPresent()) {
-            var b = match.get();
-            System.out.println("书名: " + optStr(b, "title"));
-            System.out.println("作者: " + optStr(b, "author"));
-            System.out.println("分类: " + optStr(b, "category"));
-            System.out.println("评分: " + optStr(b, "score", "N/A"));
-            var desc = optStr(b, "abstract");
-            if (!desc.isBlank()) System.out.println("简介:\n  " + desc.replace("\n", "\n  "));
-        } else {
-            System.out.println("Book ID: " + bookId);
+        // ── Page info (rich metadata from HTML) ──
+        String bookTitle = bookId;
+        try {
+            var state = parsePageState(bookId);
+            if (state instanceof JsonValue.JsonObject so) {
+                var p = so.get("page");
+                if (p instanceof JsonValue.JsonObject page) {
+                    var title = page.str("bookName");
+                    if (title != null && !title.isBlank()) bookTitle = title;
+                    System.out.println("书名: " + bookTitle);
+                    System.out.println("Book ID: " + bookId);
+
+                    var author = page.str("authorName");
+                    if (author == null || author.isBlank()) author = page.str("author");
+                    if (author != null && !author.isBlank()) System.out.println("作者: " + author);
+
+                    int status = page.integer("status", 0);
+                    System.out.println("状态: " + (status == 1 ? "连载中" : status == 2 ? "已完结" : "未知"));
+
+                    int wc = page.integer("wordNumber", 0);
+                    if (wc > 0) System.out.println("字数: " + String.format("%.1f", wc / 10000.0) + "万");
+
+                    int rc = page.integer("readCount", 0);
+                    if (rc > 0) System.out.println("在读: " + rc);
+
+                    var catV2 = page.str("categoryV2");
+                    if (catV2 != null && !catV2.isBlank()) {
+                        try {
+                            var catArr = new JsonParser(catV2).parse();
+                            if (catArr instanceof JsonValue.JsonArray arr) {
+                                var cats = new ArrayList<String>();
+                                for (var v : arr.list()) {
+                                    if (v instanceof JsonValue.JsonObject o) {
+                                        var name = o.str("Name");
+                                        if (name != null && !name.isBlank()) cats.add(name);
+                                    }
+                                }
+                                if (!cats.isEmpty()) System.out.println("分类: " + String.join(" / ", cats));
+                            }
+                        } catch (Exception ignored) {}
+                    }
+
+                    var thumb = page.str("thumbUrl");
+                    if (thumb != null && !thumb.isBlank()) System.out.println("封面: " + thumb);
+
+                    var lastCh = page.str("lastChapterTitle");
+                    if (lastCh != null && !lastCh.isBlank()) System.out.println("最近章节: " + lastCh);
+
+                    var desc = page.str("description");
+                    if (desc != null && !desc.isBlank()) System.out.println("标语: " + desc);
+
+                    if (showFull) {
+                        var abs = page.str("abstract");
+                        if (abs != null && !abs.isBlank()) System.out.println("简介:\n  " + abs.replace("\n", "\n  "));
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+            // fallback: try search API
+            var sUrl = SEARCH_URL + "?q=" + URLEncoder.encode(bookId, StandardCharsets.UTF_8) + "&aid=1967";
+            try {
+                var sJson = fetchJson(sUrl);
+                var sData = sJson instanceof JsonValue.JsonObject jo ? jo.map().get("data") : null;
+                var sRet = sData != null ? optArray(sData, "ret_data") : new JsonValue.JsonArray(new ArrayList<>());
+                var match = sRet.list().stream()
+                        .filter(v -> optStr(v, "book_id").equals(bookId))
+                        .findFirst();
+                if (match.isPresent()) {
+                    var b = match.get();
+                    System.out.println("书名: " + optStr(b, "title"));
+                    System.out.println("作者: " + optStr(b, "author"));
+                    System.out.println("分类: " + optStr(b, "category"));
+                    System.out.println("评分: " + optStr(b, "score", "N/A"));
+                    var desc = optStr(b, "abstract");
+                    if (!desc.isBlank()) System.out.println("简介:\n  " + desc.replace("\n", "\n  "));
+                } else {
+                    System.out.println("Book ID: " + bookId);
+                }
+            } catch (Exception e2) {
+                System.out.println("Book ID: " + bookId);
+            }
         }
 
-        var dJson = fetchJson(DIRECTORY_URL + "?bookId=" + bookId);
-        var dData = dJson instanceof JsonValue.JsonObject djo ? djo.map().get("data") : null;
-        var chapters = extractChapters(dData);
-        System.out.println("总章数: " + chapters.size());
+        // ── Directory ──
+        try {
+            var chapters = fetchChaptersWithFallback(bookId);
+            System.out.println("总章数: " + chapters.size());
 
-        if (!chapters.isEmpty()) {
-            String header = showFull ? "\n章节目录（共" + chapters.size() + "章）:" : "\n章节目录（前30章）:";
-            System.out.println(header);
-            System.out.println("-".repeat(60));
-            var display = (!showFull && chapters.size() > 30) ? chapters.subList(0, 30) : chapters;
-            for (var c : display) {
-                System.out.printf("  %-4d  %s%n", c.order(), c.title());
+            if (!chapters.isEmpty()) {
+                String header = showFull ? "\n章节目录（共" + chapters.size() + "章）:" : "\n章节目录（前30章）:";
+                System.out.println(header);
+                System.out.println("-".repeat(60));
+                var display = (!showFull && chapters.size() > 30) ? chapters.subList(0, 30) : chapters;
+                for (var c : display) {
+                    System.out.printf("  %-4d  %s%n", c.order(), c.title());
+                }
+                if (!showFull && chapters.size() > 30) {
+                    System.out.println("  ... 共 " + chapters.size() + " 章，使用 --full 查看完整目录");
+                }
             }
-            if (!showFull && chapters.size() > 30) {
-                System.out.println("  ... 共 " + chapters.size() + " 章，使用 --full 查看完整目录");
-            }
+        } catch (Exception e) {
+            System.err.println("获取目录失败: " + e.getMessage());
         }
     }
 
     static List<Chapter> extractChapters(JsonValue data) {
         var list = new ArrayList<Chapter>();
         if (data == null) return list;
-        var cv = data instanceof JsonValue.JsonObject jo ? jo.map().get("chapterListWithVolume") : null;
-        if (cv instanceof JsonValue.JsonArray cva) {
-            for (var vol : cva.list()) {
-                if (vol instanceof JsonValue.JsonArray va) {
-                    for (var ch : va.list()) {
-                        var itemId = optStr(ch, "itemId");
-                        var title = optStr(ch, "title");
-                        var orderStr = optStr(ch, "realChapterOrder");
-                        int order = 0;
-                        try { order = Integer.parseInt(orderStr); } catch (Exception ignored) {}
-                        if (!itemId.isBlank()) list.add(new Chapter(itemId, title, order));
-                    }
-                }
-            }
-        }
+        // Try simple keys first (parent project approach)
         if (list.isEmpty()) {
-            for (var key : new String[]{"chapterList", "chapter_list", "chapters", "items", "list"}) {
+            for (var key : new String[]{"chapterList", "chapter_list", "chapters", "items", "list", "item_list"}) {
                 var arr = optArray(data, key);
                 if (!arr.list().isEmpty()) {
                     int idx = 1;
@@ -221,14 +257,75 @@ public class Main {
                 }
             }
         }
+        // Try chapterListWithVolume (array of arrays for volumes)
+        if (list.isEmpty()) {
+            var cv = data instanceof JsonValue.JsonObject jo ? jo.map().get("chapterListWithVolume") : null;
+            if (cv instanceof JsonValue.JsonArray cva) {
+                for (var vol : cva.list()) {
+                    if (vol instanceof JsonValue.JsonArray va) {
+                        for (var ch : va.list()) {
+                            var itemId = optStr(ch, "itemId");
+                            var title = optStr(ch, "title");
+                            var orderStr = optStr(ch, "realChapterOrder");
+                            int order = 0;
+                            try { order = Integer.parseInt(orderStr); } catch (Exception ignored) {}
+                            if (!itemId.isBlank()) list.add(new Chapter(itemId, title, order));
+                        }
+                    }
+                }
+            }
+        }
+        // Try nested data.data.* (some APIs double-wrap)
+        if (list.isEmpty()) {
+            var inner = data instanceof JsonValue.JsonObject jo ? jo.get("data") : null;
+            if (inner instanceof JsonValue.JsonObject) {
+                for (var key : new String[]{"list", "chapterList", "chapter_list", "items", "item_list", "chapters"}) {
+                    var arr = optArray(inner, key);
+                    if (!arr.list().isEmpty()) {
+                        int idx = 1;
+                        for (var ch : arr.list()) {
+                            var itemId = optStr(ch, "itemId");
+                            if (itemId.isBlank()) itemId = optStr(ch, "item_id");
+                            if (!itemId.isBlank()) list.add(new Chapter(itemId, optStr(ch, "title"), idx++));
+                        }
+                        break;
+                    }
+                }
+            }
+        }
         return list;
+    }
+
+    static List<Chapter> fetchChaptersWithFallback(String bookId) {
+        // Try directory API with retry
+        for (int attempt = 0; attempt < 2; attempt++) {
+            try {
+                if (attempt > 0) Thread.sleep(1000L * attempt);
+                var dJson = fetchJson(DIRECTORY_URL + "?bookId=" + bookId);
+                var dData = dJson instanceof JsonValue.JsonObject djo ? djo.map().get("data") : null;
+                var chapters = extractChapters(dData);
+                if (!chapters.isEmpty()) return chapters;
+            } catch (Exception ignored) {}
+        }
+        // Fallback: extract chapters from page HTML __INITIAL_STATE__
+        try {
+            var state = parsePageState(bookId);
+            if (state instanceof JsonValue.JsonObject so) {
+                var page = so.get("page");
+                if (page != null) {
+                    var chapters = extractChapters(page);
+                    if (!chapters.isEmpty()) return chapters;
+                }
+            }
+        } catch (Exception ignored) {}
+        return new ArrayList<>();
     }
 
     // ── Download ────────────────────────────────────────
 
     static void handleDownload(List<String> args) throws Exception {
         if (args.isEmpty()) {
-            System.err.println("用法: download <book_id> [-start=N] [-end=N] [--output=txt] [--run=N]");
+            System.err.println("用法: download <book_id> [-start=N] [-end=N] [--output=txt] [--run=N] [--redownload=true|false]");
             System.exit(1);
         }
         var bookId = args.getFirst();
@@ -237,12 +334,13 @@ public class Main {
         String cliBookName = null;
 
         boolean redownload = false;
-        boolean redownloadExplicit = false;
         for (int i = 1; i < args.size(); i++) {
             var a = args.get(i);
-            if (a.startsWith("-start=")) start = Integer.parseInt(a.substring(7));
-            else if (a.startsWith("-end=")) end = Integer.parseInt(a.substring(5));
-            else if (a.equals("--output=txt")) outputTxt = true;
+            if (a.startsWith("--start=") || a.startsWith("-start=")) {
+                start = Integer.parseInt(a.substring(a.indexOf("start=") + 6));
+            } else if (a.startsWith("--end=") || a.startsWith("-end=")) {
+                end = Integer.parseInt(a.substring(a.indexOf("end=") + 4));
+            } else if (a.equals("--output=txt")) outputTxt = true;
             else if (a.startsWith("--run=")) {
                 batchSize = Integer.parseInt(a.substring(6));
                 if (batchSize < 1) batchSize = 1;
@@ -250,46 +348,33 @@ public class Main {
             else if (a.startsWith("--book-name=")) cliBookName = a.substring(12);
             else if (a.startsWith("--redownload=")) {
                 redownload = a.substring(13).equals("true");
-                redownloadExplicit = true;
             }
         }
 
-        System.out.println("获取目录...");
-        var dJson = fetchJson(DIRECTORY_URL + "?bookId=" + bookId);
-        var dData = dJson instanceof JsonValue.JsonObject djo ? djo.map().get("data") : null;
-        var chapters = extractChapters(dData);
-        if (chapters.isEmpty()) {
-            System.err.println("获取目录失败");
-            System.exit(1);
+        var cacheDir = CACHE_DIR.resolve(bookId);
+        var outDir = Path.of("output", bookId);
+        Files.createDirectories(outDir);
+
+        // ----- Redownload -----
+        if (redownload) {
+            System.out.println("重新下载（--redownload=true），删除缓存...");
+            deleteDirectory(cacheDir);
         }
 
-        // fetch book name: CLI override → directory API → reader page → bookId
+        // ── 1. Fetch book name + cover first (before directory) ──
+        System.out.println("获取书籍信息...");
         String bookName = bookId;
         if (cliBookName != null) {
             bookName = cliBookName;
         } else {
-            var bn = optStr(dData instanceof JsonValue.JsonObject djo2 ? djo2 : null, "bookName");
-            if (!bn.isBlank()) {
-                bookName = bn;
-            } else if (!chapters.isEmpty()) {
-                try {
-                    bookName = fetchBookName(chapters.getFirst().itemId());
-                } catch (Exception ignored) {}
-            }
-            if (bookName.equals(bookId)) {
-                System.out.println("提示: 无法自动获取书名，可用 --book-name=名称 手动指定");
-            }
+            bookName = fetchBookNameFromPage(bookId);
+            if (bookName.isBlank()) bookName = bookId;
         }
-
-        // fetch cover image: /page/{bookId} HTML → __INITIAL_STATE__.page.thumbUrl
         ImageInfo coverImage = null;
         try {
             var coverUrl = fetchCoverUrl(bookId);
-            if (coverUrl != null) {
-                coverImage = downloadImage(coverUrl);
-            }
+            if (coverUrl != null) coverImage = downloadImage(coverUrl);
         } catch (Exception ignored) {}
-        // fallback: search API thumb
         if (coverImage == null) {
             try {
                 var sUrl = SEARCH_URL + "?q=" + URLEncoder.encode(bookId, StandardCharsets.UTF_8) + "&aid=1967";
@@ -297,49 +382,86 @@ public class Main {
                 var sData = sJson instanceof JsonValue.JsonObject sjo ? sjo.map().get("data") : null;
                 var sRet = sData != null ? optArray(sData, "ret_data") : new JsonValue.JsonArray(new ArrayList<>());
                 var match = sRet.list().stream()
-                        .filter(v -> optStr(v, "book_id").equals(bookId))
-                        .findFirst();
+                        .filter(v -> optStr(v, "book_id").equals(bookId)).findFirst();
                 if (match.isPresent()) {
                     var thumb = optStr(match.get(), "thumb");
-                    if (!thumb.isBlank()) {
-                        coverImage = downloadImage(thumb);
-                    }
+                    if (!thumb.isBlank()) coverImage = downloadImage(thumb);
                 }
             } catch (Exception ignored) {}
         }
 
-        int endIdx = end <= 0 ? chapters.size() : Math.min(end, chapters.size());
+        // Early cache: save book meta + cover (no chapters yet)
+        Files.createDirectories(cacheDir);
+        if (coverImage != null) {
+            var cf = coverImage.filename().replace("images/", "");
+            Files.write(cacheDir.resolve("cover"), coverImage.data());
+        }
+        // Write partial meta.json with book name only
+        var partialMeta = "{\n  \"bookName\": \"" + jsonEscape(bookName) + "\"";
+        if (coverImage != null) {
+            partialMeta += ",\n  \"cover\": \"" + jsonEscape(coverImage.filename()) + "\""
+                         + ",\n  \"coverMime\": \"" + jsonEscape(coverImage.mime()) + "\"";
+        }
+        partialMeta += ",\n  \"chapters\": []\n}\n";
+        Files.writeString(cacheDir.resolve("meta.json"), partialMeta, StandardCharsets.UTF_8);
+        if (bookName.equals(bookId)) {
+            System.out.println("提示: 无法自动获取书名，可用 --book-name=名称 手动指定");
+        }
+
+        // ── 2. Fetch directory ──
+        System.out.println("获取目录...");
+        var chapters = fetchChaptersWithFallback(bookId);
+        if (chapters.isEmpty()) {
+            System.err.println("获取目录失败（已缓存书名和封面）");
+            System.exit(1);
+        }
+
+        // ── 3. Calculate range ──
+        int total = chapters.size();
         int startIdx = Math.max(1, start);
-        if (startIdx > chapters.size()) {
-            System.err.println("起始章节超出范围（共" + chapters.size() + "章）");
+        int endIdx = end <= 0 ? total : end;
+        if (startIdx > total) {
+            System.err.println("起始章节 " + startIdx + " 超出范围（共 " + total + " 章）");
+            System.exit(1);
+        }
+        if (endIdx > total) {
+            System.out.println("结束章节 " + endIdx + " 超出范围，已自动截断至 " + total);
+            endIdx = total;
+        }
+        if (startIdx > endIdx) {
+            System.err.println("起始章节 " + startIdx + " 大于结束章节 " + endIdx);
             System.exit(1);
         }
         var selected = chapters.subList(startIdx - 1, endIdx);
         int totalChapters = selected.size();
-        System.out.println("下载 " + startIdx + " ~ " + endIdx + " 章（共" + totalChapters + "章）");
+        System.out.println("下载第 " + startIdx + " ~ " + endIdx + " 章（共 " + totalChapters + " 章）");
 
-        var outDir = Path.of("output", bookId);
-        Files.createDirectories(outDir);
         var ext = outputTxt ? ".txt" : ".epub";
         var outputPath = outDir.resolve(bookId + "_" + startIdx + "-" + endIdx + ext);
 
-        // ----- Check cache -----
-        var cacheDir = CACHE_DIR.resolve(bookId);
-        boolean hasCache = Files.exists(cacheDir.resolve("meta.json"));
+        // ── 4. Update meta.json with chapter list (no content yet) ──
+        updateMetaCache(cacheDir, bookName, selected, startIdx, endIdx, coverImage);
 
-        if (hasCache && !redownload) {
-            System.out.println("检测到缓存，使用 --redownload=true 重新下载，--redownload=false 使用缓存");
-            System.out.println("（当前: 使用缓存）");
+        // ── 5. Check existing cache ──
+        var chDir = cacheDir.resolve("chapters");
+        var imgDir = cacheDir.resolve("images");
+        int chaptersInCache = 0;
+        if (Files.exists(chDir)) {
+            try (var files = Files.list(chDir)) {
+                chaptersInCache = (int) files.filter(p -> p.getFileName().toString().matches("\\d+")).count();
+            }
+        }
+        if (chaptersInCache >= totalChapters && !redownload) {
+            System.out.println("检测到缓存（已下载 " + chaptersInCache + "/" + totalChapters + " 章），直接生成输出...");
             generateFromCache(outputPath.toString(), bookId, outputTxt, bookName, selected, totalChapters);
             System.out.println("已保存: " + outputPath.toAbsolutePath());
             return;
         }
-        if (hasCache && redownload) {
-            System.out.println("重新下载（--redownload=true），删除缓存...");
-            deleteDirectory(cacheDir);
+        if (chaptersInCache > 0) {
+            System.out.println("使用已有缓存（已下载 " + chaptersInCache + "/" + totalChapters + " 章），继续下载剩余章节...");
         }
 
-        // ----- Download -----
+        // ── 6. Download with per-group caching ──
         System.out.println("并发组数: " + batchSize);
 
         var chapterContents = new ConcurrentHashMap<Integer, String>();
@@ -347,21 +469,71 @@ public class Main {
         var successCount = new AtomicInteger(0);
         var failCount = new AtomicInteger(0);
 
+        // Load already-cached chapters into memory
+        if (chaptersInCache > 0 && Files.exists(chDir)) {
+            try (var files = Files.list(chDir)) {
+                files.filter(p -> p.getFileName().toString().matches("\\d+")).forEach(p -> {
+                    try {
+                        var idx = Integer.parseInt(p.getFileName().toString());
+                        chapterContents.put(idx, Files.readString(p, StandardCharsets.UTF_8));
+                    } catch (Exception ignored) {}
+                });
+            }
+        }
+        // Load already-cached images
+        if (Files.exists(imgDir)) {
+            try (var files = Files.list(imgDir)) {
+                files.forEach(p -> {
+                    try {
+                        var data = Files.readAllBytes(p);
+                        var mimeAndExt = sniffMime(data);
+                        if (!mimeAndExt[0].equals("application/octet-stream")) {
+                            var fname = "images/" + p.getFileName().toString();
+                            imageCache.put(fname, new ImageInfo(data, mimeAndExt[0], fname));
+                        }
+                    } catch (Exception ignored) {}
+                });
+            }
+        }
+
         long startTime = System.currentTimeMillis();
+        Files.createDirectories(chDir);
+        Files.createDirectories(imgDir);
         final boolean isTxtOutput = outputTxt;
+        final Path fCacheDir = cacheDir;
+
+        // Initialize FQ signed API pipeline
+        try {
+            System.out.println("初始化签名引擎...");
+            System.setErr(new PrintStream(new OutputStream() {public void write(int b){}}));
+            idleFQ = new IdleFQ(false);
+            System.setErr(System.err);
+            System.out.println("获取解密密钥...");
+            decryptKey = fetchDecryptKey();
+            System.out.println("密钥已就绪");
+        } catch (Exception e) {
+            System.err.println("签名引擎初始化失败: " + e.getMessage());
+            if (idleFQ != null) try { idleFQ.destroy(); } catch (Exception ignored) {}
+            System.exit(1);
+        }
+
+        var failedMap = new ConcurrentHashMap<Integer, String>();
 
         int numGroups = (totalChapters + GROUP_SIZE - 1) / GROUP_SIZE;
         var pool = Executors.newFixedThreadPool(batchSize);
         var futures = new ArrayList<Future<?>>();
+        String fqBookId = bookId;
         for (int g = 0; g < numGroups; g++) {
             final int groupIdx = g;
+            final String gBookId = fqBookId;
+            final var fFailedMap = failedMap;
             int groupStart = g * GROUP_SIZE;
             int groupEnd = Math.min(groupStart + GROUP_SIZE, totalChapters);
             var groupChapters = new ArrayList<>(selected.subList(groupStart, groupEnd));
             futures.add(pool.submit(() -> {
                 downloadGroup(groupIdx, groupChapters, groupStart, startIdx, isTxtOutput,
                               imageCache, chapterContents, successCount, failCount,
-                              totalChapters, startTime);
+                              totalChapters, startTime, fCacheDir, gBookId, fFailedMap);
             }));
         }
 
@@ -371,12 +543,67 @@ public class Main {
         pool.shutdown();
 
         long elapsed = (System.currentTimeMillis() - startTime) / 1000;
-        System.out.println("\n下载完成: " + successCount.get() + " 成功, " + failCount.get() + " 失败, 用时 " + elapsed + "s");
+        var cached = (int) chapterContents.values().stream().filter(s -> !s.isEmpty()).count();
+        var failedSize = failedMap.size();
+        System.out.println("\n下载完成: " + cached + " 章已缓存, 本次新增 " + successCount.get() + " 成功, " + failCount.get() + " 失败, 用时 " + elapsed + "s");
 
-        // save cache
-        saveDownloadCache(bookId, bookName, selected, startIdx, endIdx, chapterContents, imageCache, coverImage);
+        // ── 7. Retry failed chapters forever ──
+        if (!failedMap.isEmpty()) {
+            verbose = true;
+            System.out.println("\n" + failedSize + " 章下载失败，开始集中重试（按 Enter 跳过等待/重置延時，Ctrl+C 停止）...");
+            int delay = 1;
+            while (!failedMap.isEmpty()) {
+                // Wait with Enter-skip support
+                boolean skipped = waitWithSkip(delay);
+                if (Thread.currentThread().isInterrupted()) break;
+                if (skipped) { delay = 1; System.out.println("  重置延时"); }
 
-        // generate output from cache
+                // Reinit device every cycle
+                try {
+                    System.out.println("--- 重试周期开始，重新注册设备 ---");
+                    reinitDevice();
+                } catch (Exception e) {
+                    System.out.println("  设备注册失败: " + e.getMessage());
+                    delay = Math.min(delay * 2, 60);
+                    System.out.println("  仍有 " + failedMap.size() + " 章失败，" + delay + "s 后重试...");
+                    continue;
+                }
+
+                // Per-chapter retry
+                var iter = failedMap.entrySet().iterator();
+                while (iter.hasNext()) {
+                    var entry = iter.next();
+                    int idx = entry.getKey();
+                    String itemId = entry.getValue();
+                    System.out.println("  重试章节 " + (idx + 1) + " (itemId=" + itemId + ")...");
+                    try {
+                        var bc = fetchBatchContent(itemId, bookId);
+                        String content = bc != null ? bc.get(itemId) : null;
+                        if (content != null && !content.isBlank()) {
+                            if (outputTxt) content = extractBlkText(content);
+                            else { content = blkToP(content); content = processImages(content, imageCache); }
+                            chapterContents.put(idx, content);
+                            Files.writeString(cacheDir.resolve("chapters").resolve(String.valueOf(idx)), content, StandardCharsets.UTF_8);
+                            iter.remove();
+                            delay = 1;
+                            System.out.println("  章节 " + (idx + 1) + " 重试成功");
+                        } else {
+                            System.out.println("  章节 " + (idx + 1) + " 返回空内容");
+                        }
+                    } catch (Exception e) {
+                        System.out.println("  章节 " + (idx + 1) + " 重试失败: " + e.getMessage());
+                    }
+                }
+
+                if (!failedMap.isEmpty()) {
+                    delay = Math.min(delay * 2, 60);
+                    System.out.println("  仍有 " + failedMap.size() + " 章失败，" + delay + "s 后重试...");
+                }
+            }
+            verbose = false;
+        }
+
+        // ── 8. Generate output from cache ──
         generateFromCache(outputPath.toString(), bookId, outputTxt, bookName, selected, totalChapters);
         System.out.println("已保存: " + outputPath.toAbsolutePath());
 
@@ -386,207 +613,526 @@ public class Main {
             files.filter(p -> p.getFileName().toString().startsWith("fanqie_"))
                  .forEach(p -> { try { Files.deleteIfExists(p); } catch (Exception ignored) {} });
         }
+        if (idleFQ != null) try { idleFQ.destroy(); } catch (Exception ignored) {}
     }
 
     static void downloadGroup(int groupIdx, List<Chapter> chapters, int offset, int startChapter,
                                boolean outputTxt, ConcurrentHashMap<String, ImageInfo> imageCache,
                                ConcurrentHashMap<Integer, String> chapterContents,
                                AtomicInteger successCount, AtomicInteger failCount,
-                               int totalChapters, long startTime) {
+                               int totalChapters, long startTime,
+                               Path cacheDir, String bookId,
+                               ConcurrentHashMap<Integer, String> failedMap) {
         int a = startChapter + offset;
         int b = startChapter + offset + chapters.size() - 1;
         synchronized (System.out) {
             System.out.println("第 " + (groupIdx + 1) + " 组 (第 " + a + "-" + b + " 章): 开始下载");
         }
+
+        String itemIds = String.join(",", chapters.stream().map(Chapter::itemId).toArray(String[]::new));
+
+        // Phase 1: 3 retries with current device
+        Map<String, String> batchContent = null;
+        Exception lastException = null;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            if (attempt > 0) {
+                synchronized (System.out) { System.out.println("  批量获取重试 (" + (attempt + 1) + "/3)"); }
+                try { Thread.sleep(2000L * (attempt + 1)); } catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
+            }
+            try {
+                batchContent = fetchBatchContent(itemIds, bookId);
+                if (batchContent != null && !batchContent.isEmpty()) break;
+            } catch (Exception e) { lastException = e; batchContent = null; }
+        }
+
+        // Phase 2: reinit device + 5 more retries
+        if (batchContent == null || batchContent.isEmpty()) {
+            synchronized (System.out) { System.out.println("  设备可能触发风控，重新初始化设备..."); }
+            try {
+                reinitDevice();
+                for (int attempt = 0; attempt < 5; attempt++) {
+                    if (attempt > 0) Thread.sleep(1000L);
+                    try {
+                        batchContent = fetchBatchContent(itemIds, bookId);
+                        if (batchContent != null && !batchContent.isEmpty()) break;
+                    } catch (Exception e) { lastException = e; batchContent = null; }
+                }
+            } catch (Exception e) {
+                lastException = e;
+                batchContent = null;
+            }
+        }
+
+        // If still failed, skip these chapters for now
+        if (batchContent == null || batchContent.isEmpty()) {
+            synchronized (System.out) {
+                System.out.println("  批量获取失败，跳过本组" + (lastException != null ? ": " + lastException.getMessage() : ""));
+            }
+            for (int i = 0; i < chapters.size(); i++) {
+                int idx = offset + i;
+                chapterContents.put(idx, "");
+                failCount.incrementAndGet();
+                failedMap.put(idx, chapters.get(i).itemId());
+            }
+            return;
+        }
+
         for (int i = 0; i < chapters.size(); i++) {
-            downloadOneChapter(chapters.get(i), offset + i, outputTxt, imageCache,
-                               chapterContents, successCount, failCount);
+            int idx = offset + i;
+            if (chapterContents.containsKey(idx) && !chapterContents.get(idx).isEmpty()) {
+                continue;
+            }
+            var ch = chapters.get(i);
+            String content = batchContent.get(ch.itemId());
+            if (content != null && !content.isBlank()) {
+                if (outputTxt) {
+                    content = extractBlkText(content);
+                } else {
+                    content = blkToP(content);
+                    content = processImages(content, imageCache);
+                }
+                chapterContents.put(idx, content);
+                successCount.incrementAndGet();
+            } else {
+                chapterContents.put(idx, "");
+                failCount.incrementAndGet();
+                failedMap.put(idx, ch.itemId());
+            }
+            if (content != null && !content.isEmpty()) {
+                try {
+                    Files.writeString(cacheDir.resolve("chapters").resolve(String.valueOf(idx)),
+                                      content, StandardCharsets.UTF_8);
+                } catch (Exception ignored) {}
+            }
+        }
+        // Save group images to cache
+        var imgDir = cacheDir.resolve("images");
+        for (var entry : imageCache.entrySet()) {
+            if ("__cover__".equals(entry.getKey())) continue;
+            var info = entry.getValue();
+            var fname = info.filename().replace("images/", "");
+            var imgFile = imgDir.resolve(fname);
+            if (!Files.exists(imgFile)) {
+                try { Files.write(imgFile, info.data()); } catch (Exception ignored) {}
+            }
         }
         synchronized (System.out) {
             System.out.println("第 " + (groupIdx + 1) + " 组 (第 " + a + "-" + b + " 章): 结束下载");
         }
     }
 
-    static void downloadOneChapter(Chapter ch, int idx, boolean outputTxt,
-                                     ConcurrentHashMap<String, ImageInfo> imageCache,
-                                     ConcurrentHashMap<Integer, String> chapterContents,
-                                     AtomicInteger successCount, AtomicInteger failCount) {
-        String content = null;
-        for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    // ── FQ signed API methods ─────────────────────────────
+
+    static String fetchDecryptKey() throws Exception {
+        if (verbose) System.out.println("  [密钥] 构建注册请求...");
+        FqVariable var = new FqVariable();
+        var.setServerDeviceId(deviceId);
+        var.setInstallId(installId);
+        var.setCdid(deviceCdid);
+        if (verbose) System.out.println("  [密钥] 使用设备 device_id=" + var.getServerDeviceId());
+        FqCrypto crypto = new FqCrypto(FqCrypto.REG_KEY);
+        String encContent = crypto.newRegisterKeyContent(var.getServerDeviceId(), "0");
+        if (verbose) System.out.println("  [密钥] encrypted_content=" + encContent.substring(0, 40) + "...");
+
+        String url = FQ_BASE_URL + "/reading/crypt/registerkey" + buildFqQS();
+        if (verbose) System.out.println("  [密钥] POST registerkey");
+        String sig = getFqSig(url);
+        byte[] raw = fqHttpPost(url, sig, ("{\"content\":\"" + encContent + "\",\"keyver\":1}").getBytes(StandardCharsets.UTF_8));
+        if (raw == null) throw new IOException("registerkey 返回空");
+
+        String resp = tryGunzip(raw);
+        if (resp == null) resp = new String(raw, StandardCharsets.UTF_8);
+
+        int p = resp.indexOf("\"key\"");
+        if (p < 0) throw new IOException("registerkey 响应无key字段: " + resp.substring(0, Math.min(120, resp.length())));
+        int c = resp.indexOf(':', p + 5);
+        int sq = resp.indexOf('"', c + 1), eq = resp.indexOf('"', sq + 1);
+        if (sq < 0 || eq <= sq) throw new IOException("key格式错误");
+        String encryptedKey = resp.substring(sq + 1, eq);
+        if (verbose) System.out.println("  [密钥] 加密密钥=" + encryptedKey.substring(0, 40) + "...");
+        String realKey = FqCrypto.getRealKey(encryptedKey);
+        if (verbose) System.out.println("  [密钥] 解密密钥=" + realKey);
+        return realKey.length() > 32 ? realKey.substring(0, 32) : realKey;
+    }
+
+    static boolean waitWithSkip(int seconds) {
+        if (verbose) System.out.println("  等待 " + seconds + "s（按 Enter 跳过）...");
+        for (int i = 0; i < seconds * 5; i++) {
+            try { Thread.sleep(200); } catch (InterruptedException e) { Thread.currentThread().interrupt(); return false; }
             try {
-                if (outputTxt) {
-                    content = fetchChapterContentTxt(ch.itemId);
-                } else {
-                    content = fetchChapterContentEpub(ch.itemId, imageCache);
+                while (System.in.available() > 0) {
+                    int b = System.in.read();
+                    if (b == '\n' || b == '\r') {
+                        while (System.in.available() > 0) System.in.read();
+                        return true;
+                    }
                 }
-                if (content != null && !content.isBlank() && !isErrorContent(content)) {
-                    break;
-                }
-                content = null;
-            } catch (Exception e) {
-                content = null;
-            }
-            if (attempt < MAX_RETRIES - 1) {
-                synchronized (System.out) {
-                    System.out.println("\n  重试 " + ch.title() + " (" + (attempt + 1) + "/" + MAX_RETRIES + ")");
-                }
-                try { Thread.sleep(2000L * (attempt + 1)); } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
-            }
+            } catch (IOException e) { return false; }
+        }
+        return false;
+    }
+
+    static void deviceRegister() throws Exception {
+        if (verbose) System.out.println("  [注册] 上报设备信息...");
+        String androidId = String.format("%016x", (long)(Math.random() * Long.MAX_VALUE));
+        String md51 = sha1Hex(androidId).substring(0, 32);
+        String md5x = md5(androidId);
+        String openudid = (md5x + md5(md5x).substring(0, 8)).toLowerCase();
+        String clientudid = UUID.randomUUID().toString().replace("-", "").substring(0, 22);
+        long now = System.currentTimeMillis();
+        String reqId = UUID.randomUUID().toString().replace("-", "").substring(0, 24);
+        String sigHash = String.format("%040x", (long)(Math.random() * Long.MAX_VALUE));
+        String ipv6 = String.format("240e:%04x:%04x:%04x:%04x:%04x:%04x:%04x",
+            (int)(Math.random()*65536),(int)(Math.random()*65536),(int)(Math.random()*65536),(int)(Math.random()*65536),
+            (int)(Math.random()*65536),(int)(Math.random()*65536),(int)(Math.random()*65536),(int)(Math.random()*65536));
+
+        String jsonBody = "{\"magic_tag\":\"ss_app_log\",\"header\":{"
+            + "\"display_name\":\"番茄小说\",\"aid\":1967,\"channel\":\"googleplay\""
+            + ",\"package\":\"com.dragon.read.oversea.gp\",\"app_version\":\"6.8.1.32\""
+            + ",\"version_code\":68132,\"update_version_code\":68132,\"manifest_version_code\":68132"
+            + ",\"sdk_version\":\"3.7.0-rc.25-fanqie-xiaoshuo-opt\",\"sdk_target_version\":29"
+            + ",\"git_hash\":\"5b6a0d3\",\"sdk_flavor\":\"china\""
+            + ",\"os\":\"Android\",\"os_version\":\"12\",\"os_api\":32"
+            + ",\"device_model\":\"OnePlus11\",\"device_brand\":\"OnePlus\",\"device_manufacturer\":\"OnePlus\""
+            + ",\"cpu_abi\":\"arm64-v8a\",\"release_build\":\"V291IR\""
+            + ",\"density_dpi\":640,\"display_density\":640,\"resolution\":\"3200*1440\""
+            + ",\"language\":\"zh\",\"timezone\":8,\"access\":\"wifi\""
+            + ",\"rom\":\"V291IR\",\"rom_version\":\"V291IR+release-keys\""
+            + ",\"cdid\":\"" + deviceCdid + "\",\"sig_hash\":\"" + sigHash + "\""
+            + ",\"openudid\":\"" + openudid + "\",\"clientudid\":\"" + clientudid + "\""
+            + ",\"android_id\":\"" + androidId + "\""
+            + ",\"region\":\"CN\",\"tz_name\":\"Asia/Shanghai\",\"tz_offset\":28800"
+            + ",\"device_platform\":\"android\",\"oaid_may_support\":false"
+            + ",\"req_id\":\"" + reqId + "\",\"sim_serial_number\":[]"
+            + ",\"ipv6_list\":[{\"type\":\"client_anpi\",\"value\":\"" + ipv6 + "\"}]"
+            + "},\"_gen_time\":" + now + "}";
+        if (verbose) {
+            System.out.println("  [注册] POST https://log5-applog.fqnovel.com/service/2/device_register/");
+            System.out.println("  [注册] 请求体(" + jsonBody.length() + "b): " + jsonBody.substring(0, Math.min(300, jsonBody.length())));
         }
 
-        chapterContents.put(idx, content != null ? content : "");
-        if (content != null && !content.isEmpty()) {
-            successCount.incrementAndGet();
-        } else {
-            failCount.incrementAndGet();
+        String params = "?aid=1967&version_code=68132&channel=googleplay&package=com.dragon.read.oversea.gp"
+                     + "&_rticket=" + now + "&use_store_region_cookie=1&okhttp_version=4.2.137.76-fanqie";
+        var req = HttpRequest.newBuilder()
+            .uri(URI.create("https://log5-applog.fqnovel.com/service/2/device_register/" + params))
+            .header("User-Agent", FQ_UA)
+            .header("Cookie", FQ_COOKIE)
+            .header("Accept", "application/json")
+            .header("Accept-Encoding", "gzip")
+            .header("Content-Type", "application/json")
+            .header("log-encode-type", "gzip")
+            .header("x-ss-req-ticket", String.valueOf(now))
+            .header("x-vc-bdturing-sdk-version", "3.7.2.cn")
+            .POST(HttpRequest.BodyPublishers.ofString(jsonBody, StandardCharsets.UTF_8))
+            .timeout(Duration.ofSeconds(15))
+            .build();
+        var resp = client.send(req, HttpResponse.BodyHandlers.ofString());
+        if (verbose) System.out.println("  [注册] 响应: " + resp.statusCode() + " " + resp.body());
+        if (resp.statusCode() == 200) {
+            try {
+                var parsed = new JsonParser(resp.body()).parse();
+                if (parsed instanceof JsonValue.JsonObject jo) {
+                    var did = jo.map().get("device_id");
+                    if (did instanceof JsonValue.JsonNumber jn) { deviceId = String.valueOf(jn.longValue()); FQ_COOKIE = "store-region=cn-zj; store-region-src=did; install_id=" + installId; }
+                    var iid = jo.map().get("install_id");
+                    if (iid instanceof JsonValue.JsonNumber jn2) { installId = String.valueOf(jn2.longValue()); FQ_COOKIE = "store-region=cn-zj; store-region-src=did; install_id=" + installId; }
+                    if (did != null || iid != null) {
+                        if (verbose) System.out.println("  [注册] 服务器返回新设备: device_id=" + deviceId + " install_id=" + installId);
+                    }
+                }
+            } catch (Exception ignored) {}
         }
     }
 
-    // ── Content extraction (TXT path) ───────────────────
-
-    static String fetchBookName(String itemId) throws Exception {
-        var html = fetchHtml("https://fanqienovel.com/reader/" + itemId);
-        var m = Pattern.compile("\"bookName\"\\s*:\\s*\"([^\"]+)\"").matcher(html);
-        return m.find() ? m.group(1) : "";
+    static String md5(String s) {
+        try {
+            var md = MessageDigest.getInstance("MD5");
+            byte[] digest = md.digest(s.getBytes(StandardCharsets.UTF_8));
+            var sb = new StringBuilder();
+            for (byte b : digest) sb.append(String.format("%02x", b));
+            return sb.toString();
+        } catch (Exception e) { return s; }
     }
 
-    static String fetchChapterContentTxt(String itemId) throws Exception {
-        var html = fetchHtml("https://fanqienovel.com/reader/" + itemId);
-        var encoded = extractEncodedText(html);
-        if (encoded == null || encoded.isBlank()) return null;
-        var decoded = decodeFanqieText(encoded);
-        return decoded.replace("上一章", "");
-    }
-
-    static String extractEncodedText(String html) {
-        var text = html.replaceAll("(?si)<script[^>]*>.*?</script>", "");
-        text = text.replaceAll("(?si)<style[^>]*>.*?</style>", "");
-        text = text.replaceAll("<br\\s*/?>", "\n");
-        text = text.replaceAll("<p[^>]*>", "\n\n");
-        text = text.replaceAll("<[^>]+>", "");
-
-        var m = Pattern.compile("更新时间[：:]\\d{4}-\\d{2}-\\d{2}", Pattern.DOTALL).matcher(text);
-        int markerEnd = m.find() ? m.end() : 0;
-
-        int encodedStart = findContentStart(text, markerEnd);
-
-        var endM = Pattern.compile("下一章|加书架|目录|下载领红包").matcher(text);
-        int end = endM.find() ? endM.start() : text.length();
-
-        if (encodedStart >= end) return text.substring(encodedStart).strip();
-
-        var content = text.substring(encodedStart, end);
-        content = decodeEntities(content);
-        content = content.replaceAll("^[　\\s」」》》'\"＂\n]*", "");
-        return content.strip();
-    }
-
-    static int findContentStart(String text, int from) {
-        for (int i = from; i < text.length(); i++) {
-            int code = text.charAt(i);
-            if (code >= CHAR_BASE) {
-                return i;
-            }
+    static synchronized void reinitDevice() throws Exception {
+        if (verbose) System.out.println("  [引擎] 销毁旧签名引擎...");
+        if (idleFQ != null) {
+            try { idleFQ.destroy(); } catch (Exception ignored) {}
         }
-        return from;
+        if (verbose) System.out.println("  [引擎] 初始化新签名引擎（保持原始设备参数）...");
+        System.setErr(new PrintStream(new OutputStream() {public void write(int b){}}));
+        idleFQ = new IdleFQ(false);
+        System.setErr(System.err);
+        if (verbose) System.out.println("  [密钥] 获取解密密钥...");
+        decryptKey = fetchDecryptKey();
+        if (verbose) System.out.println("  [密钥] 已就绪: " + decryptKey.substring(0, 8) + "...");
     }
 
-    // ── Content extraction (EPUB path) ──────────────────
+    static Map<String, String> fetchBatchContent(String itemIds, String bookId) throws Exception {
+        if (verbose) System.out.println("  [batch] item_ids=" + itemIds);
+        Map<String, String> params = buildFqParams();
+        params.put("item_ids", itemIds);
+        params.put("key_register_ts", "0");
+        params.put("book_id", bookId);
+        params.put("req_type", "1");
+        String url = FQ_BASE_URL + "/reading/reader/batch_full/v" + buildFqQS(params);
+        String sig = getFqSig(url);
+        byte[] raw = fqHttpGet(url, sig);
+        if (raw == null || raw.length == 0) throw new IOException("batch_full 返回空");
 
-    static String fetchChapterContentEpub(String itemId,
-                                           ConcurrentHashMap<String, ImageInfo> imageCache) throws Exception {
-        var html = fetchHtml("https://fanqienovel.com/reader/" + itemId);
-        var contentHtml = extractContentHtml(html);
-        if (contentHtml == null || contentHtml.isBlank()) return null;
-
-        var decoded = decodeHtmlContent(contentHtml);
-        decoded = decoded.replace("上一章", "");
-        decoded = processImages(decoded, imageCache);
-        return decoded;
-    }
-
-    static String extractContentHtml(String html) {
-        var text = html.replaceAll("(?si)<script[^>]*>.*?</script>", "");
-        text = text.replaceAll("(?si)<style[^>]*>.*?</style>", "");
-
-        // find content container by class
-        var divM = Pattern.compile(
-                "<div\\s+class\\s*=\\s*[\"']muye-reader-content[^\"']*[\"'][^>]*>",
-                Pattern.DOTALL | Pattern.CASE_INSENSITIVE).matcher(text);
-        int contentStart = divM.find() ? divM.end() : text.indexOf('<', 0);
-        if (contentStart < 0) contentStart = 0;
-
-        var endM = Pattern.compile("下一章|加书架|目录|下载领红包|muye-reader-btns").matcher(text);
-        int end = endM.find() ? endM.start() : text.length();
-
-        if (contentStart >= end) return text.substring(contentStart).strip();
-
-        var raw = text.substring(contentStart, end);
-
-        // find matching </div> for the outer content div by counting nesting
-        int depth = 1, contentEnd = raw.length();
-        for (int i = 0; i < raw.length(); i++) {
-            if (raw.charAt(i) == '<' && i + 1 < raw.length()) {
-                if (i + 6 < raw.length() && raw.substring(i, i + 6).equals("</div>")) {
-                    if (--depth <= 0) { contentEnd = i + 6; break; }
-                    i += 5;
-                } else if (i + 4 < raw.length()
-                        && raw.charAt(i + 1) == 'd' && raw.charAt(i + 2) == 'i' && raw.charAt(i + 3) == 'v'
-                        && raw.charAt(i + 4) != '/') {
-                    depth++;
+        String json = tryGunzip(raw);
+        if (json == null) json = new String(raw, StandardCharsets.UTF_8);
+        // Parse using JsonParser for correctness
+        Map<String, String> results = new HashMap<>();
+        try {
+            var parsed = new JsonParser(json).parse();
+            if (parsed instanceof JsonValue.JsonObject root) {
+                var data = root.get("data");
+                if (data instanceof JsonValue.JsonObject dataObj) {
+                    for (var entry : dataObj.map().entrySet()) {
+                        var itemId = entry.getKey();
+                        if (entry.getValue() instanceof JsonValue.JsonObject itemObj) {
+                            var contentStr = itemObj.str("content");
+                            if (contentStr != null && !contentStr.isBlank()) {
+                                try {
+                                    String decrypted = FqCrypto.decryptAndDecompressContent(contentStr, decryptKey);
+                                    results.put(itemId, decrypted);
+                                } catch (Exception ex) {
+                                    results.put(itemId, "");
+                                }
+                            }
+                        }
+                    }
                 }
             }
+        } catch (Exception e) {
+            throw new IOException("JSON解析失败: " + e.getMessage());
         }
-
-        return raw.substring(0, contentEnd).strip();
+        return results;
     }
 
-    static String decodeHtmlContent(String html) {
-        var sb = new StringBuilder();
-        boolean inTag = false;
-        for (int i = 0; i < html.length(); i++) {
-            char c = html.charAt(i);
-            if (c == '<') {
-                inTag = true;
-                sb.append(c);
-            } else if (c == '>') {
-                inTag = false;
-                sb.append(c);
-            } else if (!inTag) {
-                int code = c;
-                if (code >= CHAR_BASE && code < CHAR_BASE + CHARSET.length) {
-                    sb.append(CHARSET[code - CHAR_BASE]);
-                } else {
-                    sb.append(c);
-                }
+    static Map<String, String> buildFqParams() {
+        Map<String, String> p = new LinkedHashMap<>();
+        p.put("iid", installId);
+        p.put("device_id", deviceId);
+        p.put("ac", "wifi"); p.put("channel", "googleplay"); p.put("aid", "1967");
+        p.put("app_name", "novelapp"); p.put("version_code", "68132");
+        p.put("version_name", "6.8.1.32"); p.put("device_platform", "android");
+        p.put("os", "android"); p.put("ssmix", "a"); p.put("device_type", "OnePlus11");
+        p.put("device_brand", "OnePlus"); p.put("language", "zh"); p.put("os_api", "32");
+        p.put("os_version", "12"); p.put("manifest_version_code", "68132");
+        p.put("resolution", "3200*1440"); p.put("dpi", "640");
+        p.put("update_version_code", "68132");
+        p.put("_rticket", String.valueOf(System.currentTimeMillis()));
+        p.put("host_abi", "arm64-v8a"); p.put("dragon_device_type", "phone");
+        p.put("pv_player", "68132"); p.put("compliance_status", "0");
+        p.put("need_personal_recommend", "1"); p.put("player_so_load", "1");
+        p.put("is_android_pad_screen", "0"); p.put("rom_version", "V291IR+release-keys");
+        p.put("cdid", deviceCdid);
+        return p;
+    }
+
+    static String buildFqQS() { return buildFqQS(buildFqParams()); }
+
+    static String buildFqQS(Map<String, String> params) {
+        StringBuilder sb = new StringBuilder("?");
+        boolean first = true;
+        for (var e : params.entrySet()) {
+            if (!first) sb.append("&");
+            sb.append(e.getKey()).append("=").append(e.getValue());
+            first = false;
+        }
+        return sb.toString();
+    }
+
+    static Map<String, String> buildFqHeaders() {
+        Map<String, String> h = new LinkedHashMap<>();
+        h.put("Cookie", FQ_COOKIE);
+        h.put("User-Agent", FQ_UA);
+        h.put("Accept", "application/json; charset=utf-8");
+        h.put("Accept-Encoding", "gzip");
+        h.put("x-xs-from-web", "0");
+        h.put("x-ss-req-ticket", String.valueOf(System.currentTimeMillis()));
+        h.put("x-reading-request", System.currentTimeMillis() + "-" + (int)(Math.random() * 2e9));
+        h.put("x-vc-bdturing-sdk-version", "3.7.2.cn");
+        h.put("lc", "101"); h.put("sdk-version", "2");
+        h.put("passport-sdk-version", "50564");
+        h.put("x-tt-store-region", "cn-zj");
+        h.put("x-tt-store-region-src", "did");
+        return h;
+    }
+
+    static synchronized String getFqSig(String url) {
+        Map<String, String> h = buildFqHeaders();
+        StringBuilder sb = new StringBuilder();
+        for (var e : h.entrySet())
+            sb.append(e.getKey()).append("\r\n").append(e.getValue()).append("\r\n");
+        String hs = sb.toString();
+        if (hs.endsWith("\r\n")) hs = hs.substring(0, hs.length() - 2);
+        return idleFQ.generateSignature(url, hs);
+    }
+
+    static byte[] fqHttpGet(String url, String sig) throws Exception {
+        if (verbose) {
+            System.out.println("  [HTTP] GET " + url);
+            System.out.println("  [HTTP] Cookie: " + FQ_COOKIE);
+            System.out.println("  [HTTP] UA: " + FQ_UA);
+            if (sig != null) {
+                for (String line : sig.split("\n")) System.out.println("  [HTTP] " + line);
+            }
+        }
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        c.setRequestMethod("GET"); c.setConnectTimeout(15000); c.setReadTimeout(30000);
+        c.setRequestProperty("User-Agent", FQ_UA); c.setRequestProperty("Cookie", FQ_COOKIE);
+        if (sig != null && !sig.isEmpty()) {
+            String[] lines = sig.split("\n");
+            for (int i = 0; i < lines.length - 1; i += 2)
+                c.setRequestProperty(lines[i].trim(), lines[i + 1].trim());
+        }
+        Map<String, String> hdrs = buildFqHeaders();
+        for (var e : hdrs.entrySet()) {
+            if (!e.getKey().equals("Cookie") && !e.getKey().equals("User-Agent"))
+                c.setRequestProperty(e.getKey(), e.getValue());
+        }
+        int code = c.getResponseCode();
+        if (verbose) System.out.println("  [HTTP] 响应: " + code);
+        InputStream is = code >= 400 ? c.getErrorStream() : c.getInputStream();
+        if (is == null) return null;
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        byte[] buf = new byte[8192]; int n;
+        while ((n = is.read(buf)) != -1) bos.write(buf, 0, n);
+        byte[] data = bos.toByteArray();
+        if (verbose && data.length > 0) {
+            String preview = tryGunzip(data);
+            if (preview == null) preview = new String(data, StandardCharsets.UTF_8);
+            System.out.println("  [HTTP] 响应体(" + data.length + "b): " + preview.substring(0, Math.min(200, preview.length())));
+        }
+        is.close(); return data;
+    }
+
+    static byte[] fqHttpPost(String url, String sig, byte[] body) throws Exception {
+        if (verbose) {
+            System.out.println("  [HTTP] POST " + url);
+            System.out.println("  [HTTP] Cookie: " + FQ_COOKIE);
+            System.out.println("  [HTTP] UA: " + FQ_UA);
+            System.out.println("  [HTTP] 请求体: " + new String(body, StandardCharsets.UTF_8));
+            if (sig != null) {
+                for (String line : sig.split("\n")) System.out.println("  [HTTP] " + line);
+            }
+        }
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        c.setRequestMethod("POST"); c.setConnectTimeout(15000); c.setReadTimeout(30000);
+        c.setDoOutput(true);
+        c.setRequestProperty("Content-Type", "application/json");
+        if (sig != null && !sig.isEmpty()) {
+            String[] lines = sig.split("\n");
+            for (int i = 0; i < lines.length - 1; i += 2)
+                c.setRequestProperty(lines[i].trim(), lines[i + 1].trim());
+        }
+        Map<String, String> hdrs = buildFqHeaders();
+        for (var e : hdrs.entrySet()) {
+            if (!e.getKey().equals("Content-Type"))
+                c.setRequestProperty(e.getKey(), e.getValue());
+        }
+        c.getOutputStream().write(body); c.getOutputStream().flush();
+        int code = c.getResponseCode();
+        if (verbose) System.out.println("  [HTTP] 响应: " + code);
+        InputStream is = code >= 400 ? c.getErrorStream() : c.getInputStream();
+        if (is == null) return null;
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        byte[] buf = new byte[8192]; int n;
+        while ((n = is.read(buf)) != -1) bos.write(buf, 0, n);
+        byte[] data = bos.toByteArray();
+        if (verbose && data.length > 0) {
+            String preview = tryGunzip(data);
+            if (preview == null) preview = new String(data, StandardCharsets.UTF_8);
+            System.out.println("  [HTTP] 响应体(" + data.length + "b): " + preview.substring(0, Math.min(200, preview.length())));
+        }
+        is.close(); return data;
+    }
+
+    static String tryGunzip(byte[] data) {
+        if (data == null || data.length < 2) return null;
+        if ((data[0] & 0xff) != 0x1f || (data[1] & 0xff) != 0x8b) return null;
+        try {
+            GZIPInputStream gis = new GZIPInputStream(new ByteArrayInputStream(data));
+            ByteArrayOutputStream bos = new ByteArrayOutputStream();
+            byte[] buf = new byte[8192]; int n;
+            while ((n = gis.read(buf)) != -1) bos.write(buf, 0, n);
+            gis.close(); return bos.toString(StandardCharsets.UTF_8);
+        } catch (Exception e) { return null; }
+    }
+
+    static int findStrEnd(String s, int start) {
+        boolean esc = false;
+        for (int i = start; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (esc) { esc = false; continue; }
+            if (c == '\\') { esc = true; continue; }
+            if (c == '"') return i;
+        }
+        return s.length();
+    }
+
+    static String decodeUnicode(String s) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < s.length(); i++) {
+            if (s.charAt(i) == '\\' && i + 5 < s.length() && s.charAt(i + 1) == 'u') {
+                sb.append((char) Integer.parseInt(s.substring(i + 2, i + 6), 16));
+                i += 5;
             } else {
-                sb.append(c);
+                sb.append(s.charAt(i));
             }
         }
         return sb.toString();
     }
 
-    static String decodeEntities(String text) {
-        text = text.replaceAll("&[lL][tT];", "<").replaceAll("&[gG][tT];", ">");
-        text = text.replaceAll("&nbsp;", " ");
-        text = Pattern.compile("&#x([0-9a-fA-F]+);").matcher(text)
-                .replaceAll(mr -> String.valueOf((char) Integer.parseInt(mr.group(1), 16)));
-        text = Pattern.compile("&#(\\d+);").matcher(text)
-                .replaceAll(mr -> String.valueOf((char) Integer.parseInt(mr.group(1))));
-        text = text.replaceAll("&[aA][mM][pP];", "&");
-        return text;
+    static String extractBlkText(String html) {
+        StringBuilder sb = new StringBuilder();
+        int idx = 0;
+        boolean first = true;
+        while (true) {
+            int st = html.indexOf("<blk", idx);
+            if (st < 0) break;
+            int ct = html.indexOf(">", st);
+            if (ct < 0) break;
+            int en = html.indexOf("</blk>", ct);
+            if (en < 0) { sb.append(html.substring(ct + 1)); break; }
+            String blk = html.substring(ct + 1, en);
+            if (first) { first = false; idx = en + 6; continue; } // skip first <blk> (chapter title)
+            sb.append(blk).append("\n");
+            idx = en + 6;
+        }
+        String result = sb.toString().replace("&amp;", "&")
+                .replace("&lt;", "<").replace("&gt;", ">")
+                .replace("&quot;", "\"").replace("&apos;", "'")
+                .replace("&nbsp;", " ");
+        result = result.replaceAll("(?i)<br\\s*/?>", "\n");
+        result = result.replaceAll("<[^>]+>", "");
+        return result.strip();
     }
 
-    // ── Error detection ─────────────────────────────────
+    static String blkToP(String html) {
+        String result = html.replaceAll("(?i)<blk[^>]*>", "<p>");
+        result = result.replaceAll("(?i)</blk>", "</p>");
+        result = result.replaceAll("(?i)<imge[^>]*/>", "");
+        return result;
+    }
 
-    static boolean isErrorContent(String content) {
-        if (content.length() < 50) return true;
-        var lower = content.toLowerCase();
-        return lower.contains("验证码") || lower.contains("中间页")
-            || lower.contains("captcha") || lower.contains("verify");
+    // ── Content extraction (TXT path) ───────────────────
+
+    static String fetchBookNameFromPage(String bookId) {
+        try {
+            var state = parsePageState(bookId);
+            if (state instanceof JsonValue.JsonObject so) {
+                var page = so.get("page");
+                if (page instanceof JsonValue.JsonObject p) {
+                    var name = p.str("bookName");
+                    if (name != null) return name;
+                }
+            }
+        } catch (Exception ignored) {}
+        return "";
     }
 
     // ── Image processing ────────────────────────────────
@@ -744,8 +1290,9 @@ public class Main {
             zos.write(buildTocXhtml(bookName, chapters, totalChapters).getBytes(StandardCharsets.UTF_8));
             zos.closeEntry();
 
-            // 7. Images
+            // 7. Images (skip cover, already written above)
             for (var entry : imageCache.entrySet()) {
+                if ("__cover__".equals(entry.getKey())) continue;
                 var info = entry.getValue();
                 zos.putNextEntry(new ZipEntry("OEBPS/" + info.filename()));
                 zos.write(info.data());
@@ -977,13 +1524,89 @@ public class Main {
 
     static String fetchCoverUrl(String bookId) throws Exception {
         var html = fetchHtml("https://fanqienovel.com/page/" + bookId);
-        // __INITIAL_STATE__.page.thumbUrl
-        var m = Pattern.compile("\"thumbUrl\"\\s*:\\s*\"([^\"]+)\"").matcher(html);
-        if (m.find()) {
-            var url = m.group(1);
-            // unescape JSON unicode sequences
-            url = url.replace("\\u0026", "&").replace("\\u002F", "/");
-            return url;
+        // 1) Try ld+json first (gives real CDN-signed URL)
+        var ldUrl = extractLdJsonCover(html);
+        if (ldUrl != null) return ldUrl;
+        // 2) Try __NEXT_DATA__ / __INITIAL_STATE__
+        var state = parsePageState(bookId);
+        if (state instanceof JsonValue.JsonObject jo) {
+            var page = jo.get("page");
+            if (page instanceof JsonValue.JsonObject p) {
+                var url = p.str("thumbUrl");
+                if (url != null && !url.isBlank()) return url;
+                var thumbUri = p.str("thumbUri");
+                if (thumbUri != null && !thumbUri.isBlank()) return thumbUri;
+            }
+        }
+        return null;
+    }
+
+    static JsonValue parsePageState(String bookId) throws Exception {
+        var html = fetchHtml("https://fanqienovel.com/page/" + bookId);
+        // 1) Try __NEXT_DATA__ first (script tag with id="__NEXT_DATA__")
+        var nextData = extractScriptJson(html, "__NEXT_DATA__");
+        if (nextData != null) return nextData;
+        // 2) Fallback to __INITIAL_STATE__
+        return extractScriptJson(html, "__INITIAL_STATE__");
+    }
+
+    static JsonValue extractScriptJson(String html, String scriptId) {
+        var marker = scriptId;
+        int start = html.indexOf(marker);
+        if (start < 0) return null;
+        start = html.indexOf('{', start + marker.length());
+        if (start < 0) return null;
+        int depth = 0;
+        int end = start;
+        boolean inStr = false;
+        for (int i = start; i < html.length(); i++) {
+            char c = html.charAt(i);
+            if (inStr) {
+                if (c == '\\') i++;
+                else if (c == '"') inStr = false;
+            } else if (c == '"') {
+                inStr = true;
+            } else if (c == '{') {
+                depth++;
+            } else if (c == '}') {
+                depth--;
+                if (depth == 0) { end = i + 1; break; }
+            }
+        }
+        if (end <= start) return null;
+        try {
+            return new JsonParser(html.substring(start, end)).parse();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    static String extractLdJsonCover(String html) {
+        var m = Pattern.compile(
+            "<script[^>]*type=\"application/ld\\+json\"[^>]*>([\\s\\S]*?)</script>",
+            Pattern.CASE_INSENSITIVE).matcher(html);
+        while (m.find()) {
+            try {
+                var parsed = new JsonParser(m.group(1)).parse();
+                if (parsed instanceof JsonValue.JsonObject jo) {
+                    for (var key : List.of("image", "images")) {
+                        var v = jo.map().get(key);
+                        if (v instanceof JsonValue.JsonArray arr) {
+                            for (var item : arr.list()) {
+                                if (item instanceof JsonValue.JsonString s) {
+                                    var url = s.value().trim();
+                                    if (!url.isEmpty() && (url.startsWith("http://") || url.startsWith("https://")))
+                                        return url;
+                                }
+                            }
+                        } else if (v instanceof JsonValue.JsonString s) {
+                            var url = s.value().trim();
+                            if (!url.isEmpty() && (url.startsWith("http://") || url.startsWith("https://")))
+                                return url;
+                        }
+                    }
+                }
+            } catch (Exception ignored) {}
         }
         return null;
     }
@@ -1048,6 +1671,33 @@ public class Main {
     static String jsonEscape(String s) {
         return s.replace("\\", "\\\\").replace("\"", "\\\"")
                 .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t");
+    }
+
+    static void updateMetaCache(Path cacheDir, String bookName,
+                                 List<Chapter> chapters,
+                                 int startIdx, int endIdx,
+                                 ImageInfo coverImage) throws IOException {
+        var meta = "{\n"
+            + "  \"bookName\": \"" + jsonEscape(bookName) + "\",\n"
+            + "  \"startIdx\": " + startIdx + ",\n"
+            + "  \"endIdx\": " + endIdx + ",\n"
+            + "  \"totalChapters\": " + chapters.size() + ",\n"
+            + "  \"chapters\": [\n";
+        for (int i = 0; i < chapters.size(); i++) {
+            var ch = chapters.get(i);
+            meta += "    {\"itemId\":\"" + jsonEscape(ch.itemId())
+                 + "\",\"title\":\"" + jsonEscape(ch.title())
+                 + "\",\"order\":" + ch.order() + "}";
+            if (i < chapters.size() - 1) meta += ",";
+            meta += "\n";
+        }
+        meta += "  ]\n";
+        if (coverImage != null) {
+            meta += "  ,\"cover\":\"" + jsonEscape(coverImage.filename()) + "\"\n"
+                  + "  ,\"coverMime\":\"" + jsonEscape(coverImage.mime()) + "\"\n";
+        }
+        meta += "}\n";
+        Files.writeString(cacheDir.resolve("meta.json"), meta, StandardCharsets.UTF_8);
     }
 
     static void saveDownloadCache(String bookId, String bookName,
@@ -1212,17 +1862,4 @@ public class Main {
         }
     }
 
-    static String decodeFanqieText(String encoded) {
-        var sb = new StringBuilder();
-        for (int i = 0; i < encoded.length(); i++) {
-            char c = encoded.charAt(i);
-            int code = (int) c;
-            if (code >= CHAR_BASE && code < CHAR_BASE + CHARSET.length) {
-                sb.append(CHARSET[code - CHAR_BASE]);
-            } else {
-                sb.append(c);
-            }
-        }
-        return sb.toString();
-    }
 }

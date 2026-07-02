@@ -18,8 +18,43 @@ jar {
     manifest {
         attributes 'Main-Class': 'Main'
     }
+    from {
+        configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) }
+    }
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }
 
 tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation fileTree(dir: 'libs', include: ['*.jar'])
+
+    implementation 'com.github.zhkl0228:unidbg-android:0.9.8'
+    implementation 'com.github.zhkl0228:unidbg-api:0.9.8'
+    implementation 'com.github.zhkl0228:unidbg-unicorn2:0.9.8'
+    implementation 'com.github.zhkl0228:unidbg-dynarmic:0.9.8'
+    implementation 'com.github.zhkl0228:capstone:3.1.8'
+    implementation 'com.github.zhkl0228:unicorn:1.0.14'
+    implementation 'com.github.zhkl0228:keystone:0.9.7'
+    implementation 'com.github.zhkl0228:demumble:1.0.4'
+
+    implementation 'net.java.dev.jna:jna:5.10.0'
+    implementation 'org.scijava:native-lib-loader:2.3.5'
+    implementation 'net.dongliu:apk-parser:2.6.10'
+    implementation 'org.apache.commons:commons-collections4:4.4'
+    implementation 'commons-codec:commons-codec:1.15'
+    implementation 'org.springframework:spring-core:5.3.15'
+    implementation 'org.springframework:spring-jcl:5.3.15'
+    implementation 'commons-io:commons-io:2.6'
+    implementation 'com.alibaba:fastjson:1.2.83'
+
+    implementation 'org.slf4j:slf4j-api:1.7.33'
+    implementation 'ch.qos.logback:logback-classic:1.2.10'
+    implementation 'ch.qos.logback:logback-core:1.2.10'
 }
