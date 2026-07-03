@@ -63,9 +63,10 @@ public class Main {
     public static void main(String[] args) throws Exception {
         if (args.length == 0) {
             System.err.println("用法:");
+            System.err.println("  search <关键词>");
             System.err.println("  download <book_id> [选项...]");
             System.err.println("");
-            System.err.println("选项:");
+            System.err.println("download 选项:");
             System.err.println("  -start=N, --start=N       起始章节（从1开始）");
             System.err.println("  -end=N, --end=N           结束章节");
             System.err.println("  --output=txt              输出TXT（默认EPUB）");
@@ -73,14 +74,54 @@ public class Main {
             System.exit(1);
         }
         var cmd = args[0];
-        if (!cmd.equals("download")) {
-            System.err.println("未知命令: " + cmd);
-            System.exit(1);
-        }
         var rest = new ArrayList<>(List.of(args));
         rest.removeFirst();
-        handleDownload(rest);
+        switch (cmd) {
+            case "search" -> handleSearch(String.join(" ", rest));
+            case "download" -> handleDownload(rest);
+            default -> {
+                System.err.println("未知命令: " + cmd);
+                System.exit(1);
+            }
+        }
     }
+
+    // ── Search ──────────────────────────────────────────
+
+    static void handleSearch(String keyword) throws Exception {
+        if (keyword.isBlank()) {
+            System.err.println("关键词不能为空");
+            System.exit(1);
+        }
+        String url = SEARCH_URL + "?q=" + URLEncoder.encode(keyword, StandardCharsets.UTF_8) + "&aid=1967";
+        var json = fetchJson(url);
+        var dataObj = json instanceof JsonValue.JsonObject jo ? jo.map().get("data") : null;
+        var retData = dataObj != null ? optArray(dataObj, "ret_data") : new JsonValue.JsonArray(new ArrayList<>());
+
+        var results = retData.list().stream()
+                .map(v -> new BookInfo(
+                        optStr(v, "book_id"),
+                        optStr(v, "title"),
+                        optStr(v, "author"),
+                        optStr(v, "category"),
+                        optStr(v, "score", "N/A"),
+                        optStr(v, "abstract")))
+                .toList();
+
+        if (results.isEmpty()) {
+            System.out.println("未找到相关书籍。");
+            return;
+        }
+        System.out.println("共找到 " + results.size() + " 本小说：\n");
+        System.out.printf("%-22s  %-20s  %-16s  %s%n", "Book ID", "书名", "作者", "评分");
+        System.out.println("-".repeat(80));
+        for (var r : results) {
+            System.out.printf("%-22s  %-20s  %-16s  %s%n",
+                    r.bookId(), truncate(r.title(), 20), truncate(r.author(), 16), r.score());
+        }
+    }
+
+    // ── Download ────────────────────────────────────────
 
     static void handleDownload(List<String> args) throws Exception {
         if (args.isEmpty()) {
