@@ -75,7 +75,7 @@ public class Main {
         } catch (Exception e) { throw new RuntimeException(e); }
     }
 
-    static final int GROUP_SIZE = 10;
+    static final int GROUP_SIZE = 50;
     static final int MAX_RETRIES = 3;
     static final Pattern IMG_PATTERN = Pattern.compile(
         "<img[^>]*\\bsrc\\s*=\\s*['\"]([^'\"]+)['\"][^>]*>", Pattern.CASE_INSENSITIVE
@@ -372,7 +372,7 @@ public class Main {
             System.exit(1);
         }
         var bookId = args.getFirst();
-        int start = 1, end = 0, batchSize = 5;
+        int start = 1, end = 0, batchSize = 2;
         boolean outputTxt = false;
         String cliBookName = null;
 
@@ -983,6 +983,7 @@ public class Main {
             }
             for (int i = 0; i < chapters.size(); i++) {
                 int idx = offset + i;
+                if (chapterContents.containsKey(idx) && !chapterContents.get(idx).isEmpty()) continue;
                 chapterContents.put(idx, "");
                 failCount.incrementAndGet();
                 failedMap.put(idx, chapters.get(i).itemId());
