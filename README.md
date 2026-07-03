@@ -190,8 +190,7 @@ src/main/resources/com/dragon/read/oversea/gp/
 
 | 分支 | 说明 |
 |------|------|
-| `main` | **精简版（当前）** — 核心搜索 + 批量下载 + EPUB 导出，无冗余功能 |
-| `full` | **完整版** — 含代理轮换、设备注册、缓存断点续传、调试日志等 |
+| `main` | 核心搜索 + 批量下载 + EPUB 导出 |
 
 ### Roadmap
 
@@ -199,11 +198,10 @@ src/main/resources/com/dragon/read/oversea/gp/
 - [ ] `info` 命令（查看书籍详情 + 目录）
 - [ ] 代理池自动管理与测速
 - [ ] 批量下载稳定性优化（更细粒度的失败重试策略）
-- [ ] Windows/Mac 兼容方案（unidbg 跨平台替代）
 
 ### 贡献
 
-Issue / PR 请提交至 [GitHub](https://github.com/wzmwayne/fanqie_downloader-java_rebuild)。完整版功能在 `full` 分支维护。
+Issue / PR 请提交至 [GitHub](https://github.com/wzmwayne/fanqie_downloader-java_rebuild)。
 
 ---
 
