@@ -176,9 +176,20 @@ src/main/resources/com/dragon/read/oversea/gp/
 | spring-core, commons-io/codec | 工具类 |
 | slf4j + logback | 日志 |
 
-### 平台限制
+### 支持平台
 
-- **仅 Linux x86_64** — unidbg 模拟 arm64 SO
+基于 unidbg (unicorn + dynarmic) 原生库覆盖范围，理论上支持以下平台：
+
+| 系统 | x86_64 | ARM64 |
+|------|--------|-------|
+| Linux | ✅ 已验证 | ✅ |
+| macOS | ✅ | ✅ |
+| Windows | ✅ | ❌ |
+
+仅 Linux x86_64 经实际测试验证，其余平台需自行尝试。
+
+### 限制
+
 - 依赖番茄小说公开 API，接口变更即失效
 - 当前设备已触发风控，但 `batch_full/v1` 批量接口仍可用（部分章节返回空内容）
 
