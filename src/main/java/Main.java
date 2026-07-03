@@ -5,6 +5,8 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.PrintStream;
 import java.net.HttpURLConnection;
+import java.net.InetSocketAddress;
+import java.net.Proxy;
 import java.net.URI;
 import java.net.URL;
 import java.net.URLEncoder;
@@ -25,6 +27,8 @@ import java.util.zip.CRC32;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
+
+import javax.net.ssl.*;
 
 import com.anjia.unidbgserver.unidbg.IdleFQ;
 import com.anjia.unidbgserver.service.FqCrypto;
@@ -51,7 +55,25 @@ public class Main {
     static String deviceId = "933935730452521";
     static String installId = "933935730456617";
     static String deviceCdid = "17f05006-423a-4172-be4b-7d26a42f2f4a";
-    static boolean verbose;
+    static boolean verbose, debug;
+    static Proxy httpProxy;
+    static final String PROXY_API = "https://proxy.scdn.io/api/get_proxy.php";
+    static final Set<String> usedProxies = new HashSet<>();
+
+    static final SSLSocketFactory TRUST_ALL_SF;
+    static final HostnameVerifier TRUST_ALL_HV;
+    static {
+        try {
+            var ctx = SSLContext.getInstance("TLS");
+            ctx.init(null, new TrustManager[]{new X509TrustManager() {
+                public void checkClientTrusted(java.security.cert.X509Certificate[] c, String a) {}
+                public void checkServerTrusted(java.security.cert.X509Certificate[] c, String a) {}
+                public java.security.cert.X509Certificate[] getAcceptedIssuers() { return new java.security.cert.X509Certificate[0]; }
+            }}, null);
+            TRUST_ALL_SF = ctx.getSocketFactory();
+            TRUST_ALL_HV = (h, s) -> true;
+        } catch (Exception e) { throw new RuntimeException(e); }
+    }
 
     static final int GROUP_SIZE = 10;
     static final int MAX_RETRIES = 3;
@@ -70,7 +92,28 @@ public class Main {
             System.err.println("用法:");
             System.err.println("  search <关键词>");
             System.err.println("  info <book_id> [--full]");
-            System.err.println("  download <book_id> [-start=N] [-end=N] [--output=txt] [--run=N] [--book-name=NAME] [--redownload=true|false]");
+            System.err.println("  download <book_id> [选项...]");
+            System.err.println("");
+            System.err.println("=== download 选项 ===");
+            System.err.println("  -start=N, --start=N       起始章节（从1开始）");
+            System.err.println("  -end=N, --end=N           结束章节");
+            System.err.println("  --output=txt              输出TXT（默认EPUB）");
+            System.err.println("  --run=N                   并发线程数（默认5）");
+            System.err.println("  --book-name=名称          自定义书名");
+            System.err.println("  --redownload=true|false   强制重新下载（删除缓存）");
+            System.err.println("  --proxy=host:port         手动指定HTTP代理");
+            System.err.println("  -debug                    输出调试日志到 ./log/");
+            System.err.println("");
+            System.err.println("  ----break-all             放弃代理，逐章获取，无限重试直到Ctrl+C");
+            System.err.println("                            原文输出，不缓存，追加写入TXT");
+            System.err.println("  ----get-more=N            批量N章获取，失败逐章回退重试");
+            System.err.println("                            适合折中方案（比break-all快）");
+            System.err.println("  ----get-all               一次性批量获取所有章节，失败逐章回退");
+            System.err.println("                            适合章节少或网络好时使用");
+            System.err.println("");
+            System.err.println("说明: ----get-more 和 ----get-all 优先使用批量接口，失败章节自动转为单章重试");
+            System.err.println("      三者互斥，同时指定时优先级: ----break-all > ----get-more > ----get-all");
+            System.err.println("      三者均不缓存、不生成EPUB、直接追加写入TXT");
             System.exit(1);
         }
 
@@ -325,7 +368,7 @@ public class Main {
 
     static void handleDownload(List<String> args) throws Exception {
         if (args.isEmpty()) {
-            System.err.println("用法: download <book_id> [-start=N] [-end=N] [--output=txt] [--run=N] [--redownload=true|false]");
+            System.err.println("用法: download <book_id> [-start=N] [-end=N] [--output=txt] [--run=N] [--redownload=true|false] [--proxy=host:port]");
             System.exit(1);
         }
         var bookId = args.getFirst();
@@ -333,7 +376,9 @@ public class Main {
         boolean outputTxt = false;
         String cliBookName = null;
 
-        boolean redownload = false;
+        boolean redownload = false, breakAll = false;
+        int getMore = 0;
+        boolean getAll = false;
         for (int i = 1; i < args.size(); i++) {
             var a = args.get(i);
             if (a.startsWith("--start=") || a.startsWith("-start=")) {
@@ -349,6 +394,32 @@ public class Main {
             else if (a.startsWith("--redownload=")) {
                 redownload = a.substring(13).equals("true");
             }
+            else if (a.startsWith("--proxy=")) {
+                var p = a.substring(8).split(":");
+                httpProxy = new Proxy(Proxy.Type.HTTP, new InetSocketAddress(p[0], Integer.parseInt(p[1])));
+            }
+            else if (a.equals("-debug")) { debug = true; verbose = true; }
+            else if (a.equals("----break-all")) breakAll = true;
+            else if (a.startsWith("----get-more=")) getMore = Integer.parseInt(a.substring(13));
+            else if (a.equals("----get-all")) getAll = true;
+        }
+
+        if (debug) {
+            var logDir = Path.of("log");
+            Files.createDirectories(logDir);
+            var ts = java.time.LocalDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"));
+            var logFile = logDir.resolve(ts + "_debug_running.log");
+            var fos = new java.io.FileOutputStream(logFile.toFile());
+            var origOut = System.out;
+            var tee = new OutputStream() {
+                public void write(int b) throws IOException { origOut.write(b); fos.write(b); }
+                public void write(byte[] b, int off, int len) throws IOException { origOut.write(b, off, len); fos.write(b, off, len); }
+                public void flush() throws IOException { origOut.flush(); fos.flush(); }
+                public void close() throws IOException { fos.close(); }
+            };
+            System.setOut(new PrintStream(tee, true, StandardCharsets.UTF_8));
+            System.setErr(new PrintStream(tee, true, StandardCharsets.UTF_8));
+            System.out.println("Debug日志: " + logFile.toAbsolutePath());
         }
 
         var cacheDir = CACHE_DIR.resolve(bookId);
@@ -436,6 +507,134 @@ public class Main {
         int totalChapters = selected.size();
         System.out.println("下载第 " + startIdx + " ~ " + endIdx + " 章（共 " + totalChapters + " 章）");
 
+        // ── Break-All mode: no proxy, no device change, single chapter fetch, no cache, txt only, append ──
+        if (breakAll) {
+            System.out.println("Break-All 模式: 逐章获取，不换设备，不缓存，追加写入TXT");
+            System.out.println("按 Ctrl+C 退出");
+            // 初始化签名引擎（不换设备）
+            System.setErr(new PrintStream(new OutputStream() {public void write(int b){}}));
+            idleFQ = new IdleFQ(false);
+            System.setErr(System.err);
+            decryptKey = fetchDecryptKey();
+            httpProxy = null;
+            outputTxt = true;
+            var outPath = outDir.resolve(bookId + "_" + startIdx + "-" + endIdx + ".txt");
+            System.out.println("输出文件: " + outPath.toAbsolutePath());
+
+            for (int i = 0; i < selected.size(); i++) {
+                final int idx = i;
+                final var ch = selected.get(i);
+                String itemId = ch.itemId();
+                String title = ch.title();
+                int retryCount = 0;
+                boolean success = false;
+
+                while (!success) {
+                    retryCount++;
+                    try {
+                        var bc = fetchBatchContent(itemId, bookId);
+                        String raw = bc != null ? bc.get(itemId) : null;
+                        if (raw == null || raw.isBlank()) {
+                            System.out.println("第 " + (startIdx + idx) + " 章 " + title + " 无内容，第 " + retryCount + " 次重试...");
+                            Thread.sleep(3000);
+                            continue;
+                        }
+                        synchronized (System.out) {
+                            try (var fw = new java.io.FileWriter(outPath.toFile(), java.nio.charset.StandardCharsets.UTF_8, true)) {
+                                fw.write("\n第 " + (startIdx + idx) + " 章 " + title + "\n" + raw + "\n");
+                            }
+                        }
+                        success = true;
+                        System.out.println("第 " + (startIdx + idx) + " 章 " + title + " 完成" + (retryCount > 1 ? "（第 " + retryCount + " 次重试）" : ""));
+                    } catch (Exception e) {
+                        System.out.println("第 " + (startIdx + idx) + " 章 " + title + " 失败: " + e + "，第 " + retryCount + " 次重试...");
+                        Thread.sleep(3000);
+                    }
+                }
+            }
+            System.out.println("Break-All 全部完成 → " + outPath.toAbsolutePath());
+            return;
+        }
+
+        // ── Get-More mode: batch N chapters, retry batch on failure ──
+        if (getMore > 0) {
+            System.out.println("Get-More 模式: 批量 " + getMore + " 章，失败批量重试");
+            System.setErr(new PrintStream(new OutputStream() {public void write(int b){}}));
+            idleFQ = new IdleFQ(false);
+            System.setErr(System.err);
+            decryptKey = fetchDecryptKey();
+            httpProxy = null;
+            var chContents = new ConcurrentHashMap<Integer, String>();
+            for (int g = 0; g < totalChapters; g += getMore) {
+                int gEnd = Math.min(g + getMore, totalChapters);
+                var batch = selected.subList(g, gEnd);
+                List<Integer> failed = new ArrayList<>();
+                for (int j = g; j < gEnd; j++) failed.add(j);
+                while (!failed.isEmpty()) {
+                    var ids = failed.stream().map(i -> selected.get(i).itemId()).collect(java.util.stream.Collectors.joining(","));
+                    Thread.sleep(2000);
+                    try {
+                        var bc = fetchBatchContent(ids, bookId);
+                        var iter = failed.iterator();
+                        while (iter.hasNext()) {
+                            int j = iter.next();
+                            String raw = bc != null ? bc.get(selected.get(j).itemId()) : null;
+                            if (raw == null || raw.isBlank()) continue;
+                            String processed = outputTxt ? extractBlkText(raw) : blkToP(raw);
+                            chContents.put(j, processed);
+                            iter.remove();
+                        }
+                    } catch (Exception e) {
+                        System.out.println("  批次 " + ((g/getMore)+1) + " 批量失败: " + e);
+                    }
+                }
+                System.out.println("  批次 " + ((g/getMore)+1) + "/" + ((totalChapters+getMore-1)/getMore) + " 完成");
+            }
+            var ext = outputTxt ? ".txt" : ".epub";
+            var outputPath = outDir.resolve(bookId + "_" + startIdx + "-" + endIdx + ext);
+            generateOutput(outputPath.toString(), bookId, bookName, selected, totalChapters, outputTxt,
+                           chContents, new ConcurrentHashMap<>(), coverImage);
+            System.out.println("已保存: " + outputPath.toAbsolutePath());
+            return;
+        }
+
+        // ── Get-All mode: batch all chapters at once, retry batch on failure ──
+        if (getAll) {
+            System.out.println("Get-All 模式: 一次性批量获取全部章节，失败批量重试");
+            System.setErr(new PrintStream(new OutputStream() {public void write(int b){}}));
+            idleFQ = new IdleFQ(false);
+            System.setErr(System.err);
+            decryptKey = fetchDecryptKey();
+            httpProxy = null;
+            var chContents = new ConcurrentHashMap<Integer, String>();
+            List<Integer> failed = new ArrayList<>();
+            for (int j = 0; j < totalChapters; j++) failed.add(j);
+            while (!failed.isEmpty()) {
+                var allIds = failed.stream().map(i -> selected.get(i).itemId()).collect(java.util.stream.Collectors.joining(","));
+                Thread.sleep(2000);
+                try {
+                    var bc = fetchBatchContent(allIds, bookId);
+                    var iter = failed.iterator();
+                    while (iter.hasNext()) {
+                        int j = iter.next();
+                        String raw = bc != null ? bc.get(selected.get(j).itemId()) : null;
+                        if (raw == null || raw.isBlank()) continue;
+                        String processed = outputTxt ? extractBlkText(raw) : blkToP(raw);
+                        chContents.put(j, processed);
+                        iter.remove();
+                    }
+                } catch (Exception e) {
+                    System.out.println("  批量失败: " + e + "，" + failed.size() + " 章待重试");
+                }
+            }
+            var ext = outputTxt ? ".txt" : ".epub";
+            var outputPath = outDir.resolve(bookId + "_" + startIdx + "-" + endIdx + ext);
+            generateOutput(outputPath.toString(), bookId, bookName, selected, totalChapters, outputTxt,
+                           chContents, new ConcurrentHashMap<>(), coverImage);
+            System.out.println("已保存: " + outputPath.toAbsolutePath());
+            return;
+        }
+
         var ext = outputTxt ? ".txt" : ".epub";
         var outputPath = outDir.resolve(bookId + "_" + startIdx + "-" + endIdx + ext);
 
@@ -451,14 +650,23 @@ public class Main {
                 chaptersInCache = (int) files.filter(p -> p.getFileName().toString().matches("\\d+")).count();
             }
         }
-        if (chaptersInCache >= totalChapters && !redownload) {
-            System.out.println("检测到缓存（已下载 " + chaptersInCache + "/" + totalChapters + " 章），直接生成输出...");
+        // Count how many of the REQUESTED chapters are actually cached
+        int requestedCached = 0;
+        if (Files.exists(chDir)) {
+            for (int i = 0; i < totalChapters; i++) {
+                if (Files.exists(chDir.resolve(String.valueOf(i)))) {
+                    requestedCached++;
+                }
+            }
+        }
+        if (requestedCached >= totalChapters && !redownload) {
+            System.out.println("检测到缓存（已下载 " + requestedCached + "/" + totalChapters + " 章），直接生成输出...");
             generateFromCache(outputPath.toString(), bookId, outputTxt, bookName, selected, totalChapters);
             System.out.println("已保存: " + outputPath.toAbsolutePath());
             return;
         }
-        if (chaptersInCache > 0) {
-            System.out.println("使用已有缓存（已下载 " + chaptersInCache + "/" + totalChapters + " 章），继续下载剩余章节...");
+        if (requestedCached > 0) {
+            System.out.println("使用已有缓存（已下载 " + requestedCached + "/" + totalChapters + " 章），继续下载剩余章节...");
         }
 
         // ── 6. Download with per-group caching ──
@@ -512,7 +720,7 @@ public class Main {
             decryptKey = fetchDecryptKey();
             System.out.println("密钥已就绪");
         } catch (Exception e) {
-            System.err.println("签名引擎初始化失败: " + e.getMessage());
+            System.err.println("签名引擎初始化失败: " + e);
             if (idleFQ != null) try { idleFQ.destroy(); } catch (Exception ignored) {}
             System.exit(1);
         }
@@ -547,12 +755,24 @@ public class Main {
         var failedSize = failedMap.size();
         System.out.println("\n下载完成: " + cached + " 章已缓存, 本次新增 " + successCount.get() + " 成功, " + failCount.get() + " 失败, 用时 " + elapsed + "s");
 
-        // ── 7. Retry failed chapters forever ──
+        // ── 7. Retry failed chapters ──
         if (!failedMap.isEmpty()) {
-            verbose = true;
+            if (!debug) verbose = true;
             System.out.println("\n" + failedSize + " 章下载失败，开始集中重试（按 Enter 跳过等待/重置延時，Ctrl+C 停止）...");
             int delay = 1;
-            while (!failedMap.isEmpty()) {
+            int retryCycle = 0;
+            int prevFailedCount = failedMap.size();
+            while (!failedMap.isEmpty() && retryCycle < 30) {
+                retryCycle++;
+                // Detect stall: no progress in 3 consecutive cycles
+                if (retryCycle > 3 && failedMap.size() >= prevFailedCount) {
+                    System.out.println("  连续 " + retryCycle + " 次重试无进展，当前已失败 " + failedMap.size() + " 章");
+                    if (retryCycle >= 20) {
+                        System.out.println("  多次重试无进展，跳过剩余 " + failedMap.size() + " 章");
+                        break;
+                    }
+                }
+                prevFailedCount = failedMap.size();
                 // Wait with Enter-skip support
                 boolean skipped = waitWithSkip(delay);
                 if (Thread.currentThread().isInterrupted()) break;
@@ -563,44 +783,101 @@ public class Main {
                     System.out.println("--- 重试周期开始，重新注册设备 ---");
                     reinitDevice();
                 } catch (Exception e) {
-                    System.out.println("  设备注册失败: " + e.getMessage());
-                    delay = Math.min(delay * 2, 60);
-                    System.out.println("  仍有 " + failedMap.size() + " 章失败，" + delay + "s 后重试...");
-                    continue;
+                    System.out.println("  引擎初始化失败: " + e);
+                    if (idleFQ == null) {
+                        delay = Math.min(delay * 2, 30);
+                        System.out.println("  签名引擎不可用，" + delay + "s 后重试...");
+                        continue;
+                    }
+                    System.out.println("  使用现有引擎和密钥继续重试...");
                 }
 
-                // Per-chapter retry
-                var iter = failedMap.entrySet().iterator();
-                while (iter.hasNext()) {
-                    var entry = iter.next();
-                    int idx = entry.getKey();
-                    String itemId = entry.getValue();
-                    System.out.println("  重试章节 " + (idx + 1) + " (itemId=" + itemId + ")...");
-                    try {
-                        var bc = fetchBatchContent(itemId, bookId);
-                        String content = bc != null ? bc.get(itemId) : null;
-                        if (content != null && !content.isBlank()) {
-                            if (outputTxt) content = extractBlkText(content);
-                            else { content = blkToP(content); content = processImages(content, imageCache); }
-                            chapterContents.put(idx, content);
-                            Files.writeString(cacheDir.resolve("chapters").resolve(String.valueOf(idx)), content, StandardCharsets.UTF_8);
-                            iter.remove();
-                            delay = 1;
-                            System.out.println("  章节 " + (idx + 1) + " 重试成功");
-                        } else {
-                            System.out.println("  章节 " + (idx + 1) + " 返回空内容");
+                // Batch retry all remaining chapters (use proxy if not already set)
+                if (httpProxy == null) {
+                    System.out.println("  [代理] 批量重试前未绑定代理，尝试获取...");
+                    pickAndBindProxy();
+                }
+                var remaining = new ArrayList<>(failedMap.entrySet());
+                var idList = remaining.stream().map(Map.Entry::getValue).toArray(String[]::new);
+                String retryItemIds = String.join(",", idList);
+                System.out.println("  批量重试 " + remaining.size() + " 章 (itemIds=" + retryItemIds.substring(0, Math.min(80, retryItemIds.length())) + "...)");
+                boolean batchRetrySucceeded = false;
+                try {
+                    var bc = fetchBatchContent(retryItemIds, bookId);
+                    if (bc != null && !bc.isEmpty()) {
+                        batchRetrySucceeded = true;
+                        var iter = failedMap.entrySet().iterator();
+                        while (iter.hasNext()) {
+                            var entry = iter.next();
+                            int idx = entry.getKey();
+                            String itemId = entry.getValue();
+                            String content = bc.get(itemId);
+                            if (content != null && !content.isBlank()) {
+                                if (outputTxt) content = extractBlkText(content);
+                                else { content = blkToP(content); content = processImages(content, imageCache); }
+                                chapterContents.put(idx, content);
+                                Files.writeString(cacheDir.resolve("chapters").resolve(String.valueOf(idx)), content, StandardCharsets.UTF_8);
+                                iter.remove();
+                                System.out.println("  章节 " + (idx + 1) + " 重试成功");
+                            }
                         }
-                    } catch (Exception e) {
-                        System.out.println("  章节 " + (idx + 1) + " 重试失败: " + e.getMessage());
+                        if (!failedMap.isEmpty()) {
+                            System.out.println("  批量重试部分成功，仍有 " + failedMap.size() + " 章无内容");
+                        } else {
+                            delay = 1;
+                        }
+                    } else {
+                        System.out.println("  批量重试返回空");
+                    }
+                } catch (Exception e) {
+                    System.out.println("  批量重试失败: " + e);
+                }
+
+                // Fallback: single chapter download for remaining failures
+                if (!failedMap.isEmpty()) {
+                    System.out.println("  尝试单章下载剩余 " + failedMap.size() + " 章...");
+                    int consecutiveFails = 0;
+                    var singleIter = failedMap.entrySet().iterator();
+                    while (singleIter.hasNext()) {
+                        // If 3 consecutive failures, device is likely banned - skip rest
+                        if (consecutiveFails >= 3) {
+                            System.out.println("  连续失败 3 次，设备可能被封，跳过剩余单章重试");
+                            break;
+                        }
+                        var entry = singleIter.next();
+                        int idx = entry.getKey();
+                        String itemId = entry.getValue();
+                        try {
+                            String content = fetchSingleChapter(itemId, bookId);
+                            if (content != null && !content.isBlank()) {
+                                if (outputTxt) content = extractBlkText(content);
+                                else { content = blkToP(content); content = processImages(content, imageCache); }
+                                chapterContents.put(idx, content);
+                                Files.writeString(cacheDir.resolve("chapters").resolve(String.valueOf(idx)), content, StandardCharsets.UTF_8);
+                                singleIter.remove();
+                                consecutiveFails = 0;
+                                System.out.println("  章节 " + (idx + 1) + " 单章重试成功");
+                            } else {
+                                consecutiveFails++;
+                            }
+                        } catch (Exception e) {
+                            consecutiveFails++;
+                            System.out.println("  章节 " + (idx + 1) + " 单章重试失败: " + e);
+                        }
+                        // Small delay between single chapter requests
+                        try { Thread.sleep(500); } catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
+                    }
+                    if (failedMap.isEmpty()) {
+                        delay = 1;
                     }
                 }
 
                 if (!failedMap.isEmpty()) {
-                    delay = Math.min(delay * 2, 60);
+                    delay = Math.min(delay * 2, 600);
                     System.out.println("  仍有 " + failedMap.size() + " 章失败，" + delay + "s 后重试...");
                 }
             }
-            verbose = false;
+            if (!debug) verbose = false;
         }
 
         // ── 8. Generate output from cache ──
@@ -647,7 +924,8 @@ public class Main {
 
         // Phase 2: reinit device + 5 more retries
         if (batchContent == null || batchContent.isEmpty()) {
-            synchronized (System.out) { System.out.println("  设备可能触发风控，重新初始化设备..."); }
+            String reason = lastException != null ? lastException.toString() : "批量返回空但HTTP 200";
+            synchronized (System.out) { System.out.println("  批量获取无数据: " + reason + "，重新初始化设备..."); }
             try {
                 reinitDevice();
                 for (int attempt = 0; attempt < 5; attempt++) {
@@ -663,10 +941,45 @@ public class Main {
             }
         }
 
+        // Phase 3: Fallback to single chapter download if batch fails
+        if (batchContent == null || batchContent.isEmpty()) {
+            synchronized (System.out) {
+                System.out.println("  批量获取失败，尝试单章下载...");
+            }
+            batchContent = new HashMap<>();
+            int consecutiveFails = 0;
+            for (int i = 0; i < chapters.size(); i++) {
+                var ch = chapters.get(i);
+                if (consecutiveFails >= 3) {
+                    synchronized (System.out) {
+                        System.out.println("  连续失败 3 次，设备可能被封，跳过本组剩余单章");
+                    }
+                    break;
+                }
+                try {
+                    String content = fetchSingleChapter(ch.itemId(), bookId);
+                    if (content != null && !content.isBlank()) {
+                        batchContent.put(ch.itemId(), content);
+                        consecutiveFails = 0;
+                        synchronized (System.out) {
+                            System.out.println("  单章下载成功: " + ch.title());
+                        }
+                    } else {
+                        consecutiveFails++;
+                    }
+                } catch (Exception e) {
+                    consecutiveFails++;
+                    System.out.println("  单章下载失败: " + ch.title() + " - " + e);
+                }
+                // Small delay between single chapter requests to avoid rate limiting
+                try { Thread.sleep(500); } catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
+            }
+        }
+
         // If still failed, skip these chapters for now
         if (batchContent == null || batchContent.isEmpty()) {
             synchronized (System.out) {
-                System.out.println("  批量获取失败，跳过本组" + (lastException != null ? ": " + lastException.getMessage() : ""));
+                System.out.println("  所有下载方式均失败，跳过本组" + (lastException != null ? ": " + lastException.getMessage() : ""));
             }
             for (int i = 0; i < chapters.size(); i++) {
                 int idx = offset + i;
@@ -743,6 +1056,38 @@ public class Main {
         String resp = tryGunzip(raw);
         if (resp == null) resp = new String(raw, StandardCharsets.UTF_8);
 
+        // Parse response with error code checking (from APK's CryptERR enum)
+        try {
+            var parsed = new JsonParser(resp).parse();
+            if (parsed instanceof JsonValue.JsonObject root) {
+                int code = root.integer("code", 0);
+                if (code != 0) {
+                    String message = root.str("message", "unknown error");
+                    // Handle specific error codes from APK's CryptERR enum
+                    switch (code) {
+                        case 1 -> throw new IOException("SYSTEM: 系统错误 (code=1)");
+                        case 2 -> throw new IOException("INVALID_REQ: 无效请求 (code=2)");
+                        case 100 -> throw new IOException("FAST_REJECT: 请求被快速拒绝 (code=100)");
+                        case 110 -> throw new IOException("ILLEGAL_ACCESS: 非法访问，设备可能被封禁 (code=110)");
+                        case 500000 -> throw new IOException("KEY_TOO_OLD: 密钥过期 (code=500000)");
+                        case 500001 -> throw new IOException("ESCAPE_KEY: 逃逸密钥 (code=500001)");
+                        case 500002 -> throw new IOException("VERIFY_FAIL: 验证失败 (code=500002)");
+                        case 500003 -> {
+                            if (verbose) System.out.println("  [密钥] DEGRADE_NONEED_CRYPT: 无需加密密钥 (code=500003)");
+                            // Return empty key - will need to handle this case
+                            return "";
+                        }
+                        default -> throw new IOException("registerkey error: " + message + " (code=" + code + ")");
+                    }
+                }
+            }
+        } catch (IOException e) {
+            throw e;
+        } catch (Exception e) {
+            // Fallback to manual parsing if JsonParser fails
+        }
+
+        // Manual parsing fallback
         int p = resp.indexOf("\"key\"");
         if (p < 0) throw new IOException("registerkey 响应无key字段: " + resp.substring(0, Math.min(120, resp.length())));
         int c = resp.indexOf(':', p + 5);
@@ -785,6 +1130,7 @@ public class Main {
         String ipv6 = String.format("240e:%04x:%04x:%04x:%04x:%04x:%04x:%04x",
             (int)(Math.random()*65536),(int)(Math.random()*65536),(int)(Math.random()*65536),(int)(Math.random()*65536),
             (int)(Math.random()*65536),(int)(Math.random()*65536),(int)(Math.random()*65536),(int)(Math.random()*65536));
+        String newCdid = UUID.randomUUID().toString();
 
         String jsonBody = "{\"magic_tag\":\"ss_app_log\",\"header\":{"
             + "\"display_name\":\"番茄小说\",\"aid\":1967,\"channel\":\"googleplay\""
@@ -798,7 +1144,7 @@ public class Main {
             + ",\"density_dpi\":640,\"display_density\":640,\"resolution\":\"3200*1440\""
             + ",\"language\":\"zh\",\"timezone\":8,\"access\":\"wifi\""
             + ",\"rom\":\"V291IR\",\"rom_version\":\"V291IR+release-keys\""
-            + ",\"cdid\":\"" + deviceCdid + "\",\"sig_hash\":\"" + sigHash + "\""
+            + ",\"cdid\":\"" + newCdid + "\",\"sig_hash\":\"" + sigHash + "\""
             + ",\"openudid\":\"" + openudid + "\",\"clientudid\":\"" + clientudid + "\""
             + ",\"android_id\":\"" + androidId + "\""
             + ",\"region\":\"CN\",\"tz_name\":\"Asia/Shanghai\",\"tz_offset\":28800"
@@ -813,31 +1159,56 @@ public class Main {
 
         String params = "?aid=1967&version_code=68132&channel=googleplay&package=com.dragon.read.oversea.gp"
                      + "&_rticket=" + now + "&use_store_region_cookie=1&okhttp_version=4.2.137.76-fanqie";
-        var req = HttpRequest.newBuilder()
-            .uri(URI.create("https://log5-applog.fqnovel.com/service/2/device_register/" + params))
-            .header("User-Agent", FQ_UA)
-            .header("Cookie", FQ_COOKIE)
-            .header("Accept", "application/json")
-            .header("Accept-Encoding", "gzip")
-            .header("Content-Type", "application/json")
-            .header("log-encode-type", "gzip")
-            .header("x-ss-req-ticket", String.valueOf(now))
-            .header("x-vc-bdturing-sdk-version", "3.7.2.cn")
-            .POST(HttpRequest.BodyPublishers.ofString(jsonBody, StandardCharsets.UTF_8))
-            .timeout(Duration.ofSeconds(15))
-            .build();
-        var resp = client.send(req, HttpResponse.BodyHandlers.ofString());
-        if (verbose) System.out.println("  [注册] 响应: " + resp.statusCode() + " " + resp.body());
-        if (resp.statusCode() == 200) {
+        var u = new URL("https://log5-applog.fqnovel.com/service/2/device_register/" + params);
+        var conn = (HttpURLConnection) (httpProxy != null ? u.openConnection(httpProxy) : u.openConnection());
+        conn.setRequestMethod("POST");
+        conn.setConnectTimeout(15000);
+        conn.setReadTimeout(30000);
+        conn.setDoOutput(true);
+        conn.setRequestProperty("User-Agent", FQ_UA);
+        conn.setRequestProperty("Cookie", FQ_COOKIE);
+        conn.setRequestProperty("Accept", "application/json");
+        conn.setRequestProperty("Accept-Encoding", "gzip");
+        conn.setRequestProperty("Content-Type", "application/json");
+        conn.setRequestProperty("log-encode-type", "gzip");
+        conn.setRequestProperty("x-ss-req-ticket", String.valueOf(now));
+        conn.setRequestProperty("x-vc-bdturing-sdk-version", "3.7.2.cn");
+        conn.getOutputStream().write(jsonBody.getBytes(StandardCharsets.UTF_8));
+        conn.getOutputStream().flush();
+        int statusCode = conn.getResponseCode();
+        InputStream is = statusCode >= 400 ? conn.getErrorStream() : conn.getInputStream();
+        byte[] raw = is.readAllBytes();
+        String respBody = tryGunzip(raw);
+        if (respBody == null) respBody = new String(raw, StandardCharsets.UTF_8);
+        conn.disconnect();
+        if (verbose) System.out.println("  [注册] 响应: " + statusCode + " " + respBody);
+        if (statusCode == 200) {
             try {
-                var parsed = new JsonParser(resp.body()).parse();
+                var parsed = new JsonParser(respBody).parse();
                 if (parsed instanceof JsonValue.JsonObject jo) {
+                    String newDeviceId = deviceId;
+                    String newInstallId = installId;
                     var did = jo.map().get("device_id");
-                    if (did instanceof JsonValue.JsonNumber jn) { deviceId = String.valueOf(jn.longValue()); FQ_COOKIE = "store-region=cn-zj; store-region-src=did; install_id=" + installId; }
+                    if (did instanceof JsonValue.JsonNumber jn) newDeviceId = String.valueOf(jn.longValue());
                     var iid = jo.map().get("install_id");
-                    if (iid instanceof JsonValue.JsonNumber jn2) { installId = String.valueOf(jn2.longValue()); FQ_COOKIE = "store-region=cn-zj; store-region-src=did; install_id=" + installId; }
-                    if (did != null || iid != null) {
-                        if (verbose) System.out.println("  [注册] 服务器返回新设备: device_id=" + deviceId + " install_id=" + installId);
+                    if (iid instanceof JsonValue.JsonNumber jn2) newInstallId = String.valueOf(jn2.longValue());
+                    if (!newDeviceId.equals(deviceId) || !newInstallId.equals(installId)) {
+                        if ("0".equals(newDeviceId) && "0".equals(newInstallId)) {
+                            // Server refused — generate random IDs instead of keeping banned ones
+                            newDeviceId = String.valueOf(10_000_000_000_000_000L + (long)(Math.random() * 8_999_999_999_999_999L));
+                            newInstallId = String.valueOf(Long.parseLong(newDeviceId) + 1 + (int)(Math.random() * 1000));
+                            deviceId = newDeviceId;
+                            installId = newInstallId;
+                            deviceCdid = newCdid;
+                            FQ_COOKIE = "store-region=cn-zj; store-region-src=did; install_id=" + installId;
+                            if (verbose) System.out.println("  [注册] 服务器拒绝注册，改用随机设备: device_id=" + deviceId + " install_id=" + installId + " cdid=" + deviceCdid);
+                        } else {
+                            deviceId = newDeviceId;
+                            installId = newInstallId;
+                            deviceCdid = newCdid;
+                            FQ_COOKIE = "store-region=cn-zj; store-region-src=did; install_id=" + installId;
+                            if (verbose) System.out.println("  [注册] 服务器返回新设备: device_id=" + deviceId + " install_id=" + installId + " cdid=" + deviceCdid);
+                        }
                     }
                 }
             } catch (Exception ignored) {}
@@ -855,17 +1226,25 @@ public class Main {
     }
 
     static synchronized void reinitDevice() throws Exception {
+        if (verbose) System.out.println("  [设备] 注册新设备...");
+        System.out.println("  [代理] 为新设备绑定代理...");
+        pickAndBindProxy();
+        deviceRegister();
         if (verbose) System.out.println("  [引擎] 销毁旧签名引擎...");
         if (idleFQ != null) {
             try { idleFQ.destroy(); } catch (Exception ignored) {}
         }
-        if (verbose) System.out.println("  [引擎] 初始化新签名引擎（保持原始设备参数）...");
+        if (verbose) System.out.println("  [引擎] 初始化新签名引擎...");
         System.setErr(new PrintStream(new OutputStream() {public void write(int b){}}));
         idleFQ = new IdleFQ(false);
         System.setErr(System.err);
         if (verbose) System.out.println("  [密钥] 获取解密密钥...");
-        decryptKey = fetchDecryptKey();
-        if (verbose) System.out.println("  [密钥] 已就绪: " + decryptKey.substring(0, 8) + "...");
+        try {
+            decryptKey = fetchDecryptKey();
+            if (verbose) System.out.println("  [密钥] 已就绪: " + decryptKey.substring(0, 8) + "...");
+        } catch (Exception e) {
+            System.out.println("  [密钥] 获取失败: " + e + "，使用旧密钥: " + (decryptKey != null ? decryptKey.substring(0, 8) + "..." : "null"));
+        }
     }
 
     static Map<String, String> fetchBatchContent(String itemIds, String bookId) throws Exception {
@@ -875,31 +1254,149 @@ public class Main {
         params.put("key_register_ts", "0");
         params.put("book_id", bookId);
         params.put("req_type", "1");
-        String url = FQ_BASE_URL + "/reading/reader/batch_full/v" + buildFqQS(params);
+        String url = FQ_BASE_URL + "/reading/reader/batch_full/v1" + buildFqQS(params);
         String sig = getFqSig(url);
         byte[] raw = fqHttpGet(url, sig);
-        if (raw == null || raw.length == 0) throw new IOException("batch_full 返回空");
+        if (raw == null || raw.length == 0) throw new IOException("batch_full 返回空 (url=" + url + ")");
 
         String json = tryGunzip(raw);
         if (json == null) json = new String(raw, StandardCharsets.UTF_8);
-        // Parse using JsonParser for correctness
+
+        // Parse response with error code checking (based on APK analysis)
         Map<String, String> results = new HashMap<>();
         try {
             var parsed = new JsonParser(json).parse();
             if (parsed instanceof JsonValue.JsonObject root) {
+                // Check error code first (from APK's ReaderApiERR enum)
+                int code = root.integer("code", 0);
+                if (code != 0) {
+                    String message = root.str("message", "unknown error");
+                    // Handle specific error codes from APK analysis
+                    switch (code) {
+                        case 100 -> throw new IOException("FAST_REJECT: 请求被快速拒绝 (code=100)");
+                        case 110 -> throw new IOException("ILLEGAL_ACCESS: 非法访问，设备可能被封禁 (code=110)");
+                        case 111 -> throw new IOException("HIT_VERIFY_CODE: 触发验证码 (code=111)");
+                        case 101004 -> throw new IOException("BOOK_NOT_EXIST_ERROR: 书籍不存在 (code=101004)");
+                        case 101005 -> throw new IOException("CHAPTER_DATA_GET_ERROR: 章节数据获取错误 (code=101005)");
+                        case 101009 -> throw new IOException("USER_NO_PERMISSION: 用户无权限 (code=101009)");
+                        case 101017 -> throw new IOException("CONTENT_VERIFYING: 内容审核中 (code=101017)");
+                        case 101021 -> throw new IOException("BOOK_FULLLY_REMOVE: 书籍已被完全移除 (code=101021)");
+                        default -> {
+                            if (code >= 100 && code <= 111) {
+                                throw new IOException("ReaderApiERR: " + message + " (code=" + code + ")");
+                            }
+                            // Non-critical error codes (101xxx) - log but continue
+                            System.out.println("  [batch] 响应码=" + code + " " + message);
+                            // If data is empty, include error so caller knows
+                            var d = root.get("data");
+                            if (!(d instanceof JsonValue.JsonObject) || ((JsonValue.JsonObject)d).map().isEmpty()) {
+                                throw new IOException("响应错误 " + code + ": " + message);
+                            }
+                        }
+                    }
+                }
+
                 var data = root.get("data");
                 if (data instanceof JsonValue.JsonObject dataObj) {
                     for (var entry : dataObj.map().entrySet()) {
                         var itemId = entry.getKey();
                         if (entry.getValue() instanceof JsonValue.JsonObject itemObj) {
+                            // Extract chapter title if available
+                            String title = itemObj.str("title", "");
+                            if (verbose && !title.isEmpty()) {
+                                System.out.println("  [batch] 章节: " + title);
+                            }
+
+                            // Check crypt_status (from APK's ItemContent model)
+                            // crypt_status: 0=encrypted, 1=NOT encrypted (direct use), 2=key expired (need re-register)
+                            int cryptStatus = itemObj.integer("crypt_status", 0);
+
                             var contentStr = itemObj.str("content");
                             if (contentStr != null && !contentStr.isBlank()) {
                                 try {
-                                    String decrypted = FqCrypto.decryptAndDecompressContent(contentStr, decryptKey);
+                                    String decrypted;
+                                    switch (cryptStatus) {
+                                        case 1 -> {
+                                            // NOT encrypted - use content directly
+                                            decrypted = contentStr;
+                                            if (verbose) System.out.println("  [batch] 章节未加密 (crypt_status=1)");
+                                        }
+                                        case 2 -> {
+                                            // Key expired/missing - need re-register (handled by caller)
+                                            decrypted = contentStr;
+                                            if (verbose) System.out.println("  [batch] 密钥过期，尝试直接使用 (crypt_status=2)");
+                                        }
+                                        default -> {
+                                            // crypt_status=0 or unknown - decrypt normally
+                                            decrypted = FqCrypto.decryptAndDecompressContent(contentStr, decryptKey);
+                                        }
+                                    }
                                     results.put(itemId, decrypted);
                                 } catch (Exception ex) {
+                                    System.out.println("  [batch] 解密失败 itemId=" + itemId + " crypt=" + cryptStatus + ": " + ex);
                                     results.put(itemId, "");
                                 }
+                            }
+                        }
+                        }
+                }
+            }
+        } catch (IOException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException("JSON解析失败: " + e);
+        }
+        if (results.isEmpty()) {
+            System.out.println("  [batch] 完整响应: " + json.substring(0, Math.min(2000, json.length())));
+        }
+        return results;
+    }
+
+    // Single chapter download fallback (from APK's /reading/reader/newfull/v:version/)
+    static String fetchSingleChapter(String itemId, String bookId) throws Exception {
+        if (verbose) System.out.println("  [single] item_id=" + itemId);
+        Map<String, String> params = buildFqParams();
+        params.put("item_id", itemId);
+        params.put("key_register_ts", "0");
+        params.put("book_id", bookId);
+        params.put("req_type", "1");
+        String url = FQ_BASE_URL + "/reading/reader/newfull/v1" + buildFqQS(params);
+        String sig = getFqSig(url);
+        byte[] raw = fqHttpGet(url, sig);
+        if (raw == null || raw.length == 0) throw new IOException("newfull 返回空");
+
+        String json = tryGunzip(raw);
+        if (json == null) json = new String(raw, StandardCharsets.UTF_8);
+
+        try {
+            var parsed = new JsonParser(json).parse();
+            if (parsed instanceof JsonValue.JsonObject root) {
+                // Check error code
+                int code = root.integer("code", 0);
+                if (code != 0) {
+                    String message = root.str("message", "unknown error");
+                    throw new IOException("newfull error: " + message + " (code=" + code + ")");
+                }
+
+                var data = root.get("data");
+                if (data instanceof JsonValue.JsonObject dataObj) {
+                    // Check crypt_status
+                    int cryptStatus = dataObj.integer("crypt_status", 0);
+
+                    var contentStr = dataObj.str("content");
+                    if (contentStr != null && !contentStr.isBlank()) {
+                        switch (cryptStatus) {
+                            case 1 -> {
+                                // NOT encrypted - use directly
+                                return contentStr;
+                            }
+                            case 2 -> {
+                                // Key expired/missing - try direct use
+                                return contentStr;
+                            }
+                            default -> {
+                                // crypt_status=0 - decrypt normally
+                                return FqCrypto.decryptAndDecompressContent(contentStr, decryptKey);
                             }
                         }
                     }
@@ -908,7 +1405,7 @@ public class Main {
         } catch (Exception e) {
             throw new IOException("JSON解析失败: " + e.getMessage());
         }
-        return results;
+        return "";
     }
 
     static Map<String, String> buildFqParams() {
@@ -972,6 +1469,146 @@ public class Main {
         return idleFQ.generateSignature(url, hs);
     }
 
+    static HttpURLConnection openFqConn(String url) throws Exception {
+        var u = new URL(url);
+        return (HttpURLConnection) (httpProxy != null ? u.openConnection(httpProxy) : u.openConnection());
+    }
+
+    static List<String> fetchChineseProxies() {
+        try {
+            var url = PROXY_API + "?protocol=https&count=50&country_code=CN";
+            var conn = (HttpURLConnection) new URL(url).openConnection();
+            conn.setConnectTimeout(10000); conn.setReadTimeout(10000);
+            int code = conn.getResponseCode();
+            if (code != 200) return List.of();
+            byte[] raw = conn.getInputStream().readAllBytes();
+            conn.disconnect();
+            String json = new String(raw, StandardCharsets.UTF_8);
+            var parsed = new JsonParser(json).parse();
+            if (parsed instanceof JsonValue.JsonObject jo && jo.integer("code", 0) == 200) {
+                var data = jo.obj("data");
+                if (data != null) {
+                    var proxies = data.arr("proxies");
+                    if (proxies != null && !proxies.isEmpty()) {
+                        return proxies.stream().map(v -> ((JsonValue.JsonString)v).value()).toList();
+                    }
+                }
+            }
+        } catch (Exception e) {
+            if (verbose) System.out.println("  [代理] 获取代理失败: " + e.getMessage());
+        }
+        return List.of();
+    }
+
+    /** 测试代理，成功返回 null 并将延迟(ms)写入 outLatency，失败返回错误原因（跳过证书验证，仅测连通性） */
+    static String testProxy(Proxy p, long[] outLatency) {
+        try {
+            var url = new URL("https://www.baidu.com/");
+            var conn = (HttpURLConnection) url.openConnection(p);
+            conn.setConnectTimeout(20000); conn.setReadTimeout(15000);
+            // 跳过证书验证——仅测隧道连通性，不关心 MITM
+            if (conn instanceof HttpsURLConnection ssl) {
+                ssl.setSSLSocketFactory(TRUST_ALL_SF);
+                ssl.setHostnameVerifier(TRUST_ALL_HV);
+            }
+            long start = System.nanoTime();
+            int code = conn.getResponseCode();
+            long latency = (System.nanoTime() - start) / 1_000_000;
+            conn.disconnect();
+            if (code == 200) {
+                outLatency[0] = latency;
+                return null;
+            }
+            return "返回码=" + code;
+        } catch (java.net.SocketTimeoutException e) {
+            return "超时";
+        } catch (java.net.ConnectException e) {
+            return "连接被拒绝";
+        } catch (javax.net.ssl.SSLException e) {
+            return "SSL错误: " + e.getMessage();
+        } catch (Exception e) {
+            return e.getClass().getSimpleName() + ": " + e.getMessage();
+        }
+    }
+
+    static final String[] BUILT_IN_PROXIES = {
+        "180.166.128.182:12011",
+        "8.138.131.110:9095"
+    };
+
+    /** 多线程测试所有候选代理，返回延迟最小的（不可用返回null） */
+    static String pickBestProxy(List<String> candidates) {
+        int total = candidates.size();
+        var bestRef = new String[1];
+        var bestLatRef = new long[]{Long.MAX_VALUE};
+        var latch = new CountDownLatch(total);
+        var executor = Executors.newFixedThreadPool(10);
+        var started = new AtomicInteger(0);
+        for (var proxyStr : candidates) {
+            executor.submit(() -> {
+                int idx = started.incrementAndGet();
+                String[] parts = proxyStr.split(":");
+                var p = new Proxy(Proxy.Type.HTTP, new InetSocketAddress(parts[0], Integer.parseInt(parts[1])));
+                var latArr = new long[1];
+                String err = testProxy(p, latArr);
+                if (err == null) {
+                    long latency = latArr[0];
+                    System.out.println("  [" + idx + "/" + total + "] " + proxyStr + " 延迟=" + latency + "ms");
+                    synchronized (bestRef) {
+                        if (latency < bestLatRef[0]) {
+                            bestLatRef[0] = latency;
+                            bestRef[0] = proxyStr;
+                        }
+                    }
+                } else {
+                    System.out.println("  [" + idx + "/" + total + "] " + proxyStr + " " + err);
+                }
+                latch.countDown();
+            });
+        }
+        executor.shutdown();
+        try { latch.await(30, TimeUnit.SECONDS); } catch (InterruptedException ignored) {}
+        executor.shutdownNow();
+        return bestRef[0];
+    }
+
+    /** 获取50个代理（含内置），10线程并行测速，选延迟最小且未用过的绑定到 httpProxy */
+    static boolean pickAndBindProxy() {
+        for (int attempt = 0; attempt < 10; attempt++) {
+            var candidates = new ArrayList<String>();
+            // 内置代理优先
+            for (var p : BUILT_IN_PROXIES) {
+                if (!usedProxies.contains(p)) candidates.add(p);
+            }
+            // API 代理
+            System.out.println("  [代理] 获取50个中国HTTPS代理...");
+            var apiProxies = fetchChineseProxies();
+            if (apiProxies.isEmpty()) {
+                System.out.println("  [代理] API未返回代理");
+            } else {
+                System.out.println("  [代理] API返回 " + apiProxies.size() + " 个（API可能限制上限）");
+                apiProxies.stream().filter(p -> !usedProxies.contains(p)).forEach(candidates::add);
+            }
+            if (candidates.isEmpty()) {
+                System.out.println("  [代理] 所有代理已使用过");
+                return false;
+            }
+            System.out.println("  [代理] " + candidates.size() + " 个候选代理，10线程并行测速...");
+            var best = pickBestProxy(candidates);
+            if (best != null) {
+                usedProxies.add(best);
+                String[] parts = best.split(":");
+                httpProxy = new Proxy(Proxy.Type.HTTP, new InetSocketAddress(parts[0], Integer.parseInt(parts[1])));
+                System.out.println("  [代理] 已绑定 " + best);
+                return true;
+            }
+            System.out.println("  [代理] 本轮 " + candidates.size() + " 个代理全部不可用，重新获取...");
+            usedProxies.addAll(candidates);
+        }
+        System.out.println("  [代理] 连续10次获取均无可用代理");
+        return false;
+    }
+
     static byte[] fqHttpGet(String url, String sig) throws Exception {
         if (verbose) {
             System.out.println("  [HTTP] GET " + url);
@@ -981,7 +1618,7 @@ public class Main {
                 for (String line : sig.split("\n")) System.out.println("  [HTTP] " + line);
             }
         }
-        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        HttpURLConnection c = openFqConn(url);
         c.setRequestMethod("GET"); c.setConnectTimeout(15000); c.setReadTimeout(30000);
         c.setRequestProperty("User-Agent", FQ_UA); c.setRequestProperty("Cookie", FQ_COOKIE);
         if (sig != null && !sig.isEmpty()) {
@@ -995,17 +1632,24 @@ public class Main {
                 c.setRequestProperty(e.getKey(), e.getValue());
         }
         int code = c.getResponseCode();
-        if (verbose) System.out.println("  [HTTP] 响应: " + code);
+        System.out.println("  [HTTP] " + url.substring(0, Math.min(120, url.length())) + " → " + code);
         InputStream is = code >= 400 ? c.getErrorStream() : c.getInputStream();
-        if (is == null) return null;
+        if (is == null) {
+            System.out.println("  [HTTP] 无法获取响应流");
+            return null;
+        }
         ByteArrayOutputStream bos = new ByteArrayOutputStream();
         byte[] buf = new byte[8192]; int n;
         while ((n = is.read(buf)) != -1) bos.write(buf, 0, n);
         byte[] data = bos.toByteArray();
-        if (verbose && data.length > 0) {
+        if (data.length > 0 && (verbose || code >= 400)) {
             String preview = tryGunzip(data);
             if (preview == null) preview = new String(data, StandardCharsets.UTF_8);
-            System.out.println("  [HTTP] 响应体(" + data.length + "b): " + preview.substring(0, Math.min(200, preview.length())));
+            if (debug) {
+                System.out.println("  [HTTP] 响应体(" + data.length + "b): " + preview);
+            } else {
+                System.out.println("  [HTTP] 响应体(" + data.length + "b): " + preview.substring(0, Math.min(500, preview.length())));
+            }
         }
         is.close(); return data;
     }
@@ -1020,7 +1664,7 @@ public class Main {
                 for (String line : sig.split("\n")) System.out.println("  [HTTP] " + line);
             }
         }
-        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        HttpURLConnection c = openFqConn(url);
         c.setRequestMethod("POST"); c.setConnectTimeout(15000); c.setReadTimeout(30000);
         c.setDoOutput(true);
         c.setRequestProperty("Content-Type", "application/json");
@@ -1036,17 +1680,21 @@ public class Main {
         }
         c.getOutputStream().write(body); c.getOutputStream().flush();
         int code = c.getResponseCode();
-        if (verbose) System.out.println("  [HTTP] 响应: " + code);
+        System.out.println("  [HTTP] POST " + url.substring(0, Math.min(120, url.length())) + " → " + code);
         InputStream is = code >= 400 ? c.getErrorStream() : c.getInputStream();
         if (is == null) return null;
         ByteArrayOutputStream bos = new ByteArrayOutputStream();
         byte[] buf = new byte[8192]; int n;
         while ((n = is.read(buf)) != -1) bos.write(buf, 0, n);
         byte[] data = bos.toByteArray();
-        if (verbose && data.length > 0) {
+        if (data.length > 0 && (verbose || code >= 400)) {
             String preview = tryGunzip(data);
             if (preview == null) preview = new String(data, StandardCharsets.UTF_8);
-            System.out.println("  [HTTP] 响应体(" + data.length + "b): " + preview.substring(0, Math.min(200, preview.length())));
+            if (debug) {
+                System.out.println("  [HTTP] 响应体(" + data.length + "b): " + preview);
+            } else {
+                System.out.println("  [HTTP] 响应体(" + data.length + "b): " + preview.substring(0, Math.min(500, preview.length())));
+            }
         }
         is.close(); return data;
     }
