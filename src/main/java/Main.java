@@ -16,6 +16,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
@@ -621,6 +622,7 @@ public class Main {
             mimetypeEntry.setMethod(ZipEntry.STORED); mimetypeEntry.setSize(mimetype.length);
             mimetypeEntry.setCompressedSize(mimetype.length);
             var crc = new CRC32(); crc.update(mimetype); mimetypeEntry.setCrc(crc.getValue());
+            mimetypeEntry.setExtra(new byte[0]);
             zos.putNextEntry(mimetypeEntry); zos.write(mimetype); zos.closeEntry();
 
             zos.putNextEntry(new ZipEntry("META-INF/container.xml"));
@@ -654,9 +656,9 @@ public class Main {
                 itemIds.add(String.format("chapter_%05d.xhtml", i + 1));
             }
 
-            String tocHref = "toc.xhtml";
-            zos.putNextEntry(new ZipEntry("OEBPS/" + tocHref));
-            zos.write(buildTocXhtml(bookName, chapters, totalChapters).getBytes(StandardCharsets.UTF_8));
+            String navHref = "nav.xhtml";
+            zos.putNextEntry(new ZipEntry("OEBPS/" + navHref));
+            zos.write(buildNavXhtml(bookName, chapters, totalChapters).getBytes(StandardCharsets.UTF_8));
             zos.closeEntry();
 
             for (var entry : imageCache.entrySet()) {
@@ -667,7 +669,7 @@ public class Main {
             }
 
             zos.putNextEntry(new ZipEntry("OEBPS/content.opf"));
-            zos.write(buildOpfXml(bookId, bookName, chapters, imageCache, itemIds, coverHref, tocHref, totalChapters)
+            zos.write(buildOpfXml(bookId, bookName, chapters, imageCache, itemIds, coverHref, navHref, totalChapters)
                      .getBytes(StandardCharsets.UTF_8));
             zos.closeEntry();
 
@@ -689,37 +691,44 @@ public class Main {
 
     static String buildOpfXml(String bookId, String bookName, List<Chapter> chapters,
                                ConcurrentHashMap<String, ImageInfo> imageCache,
-                               List<String> itemIds, String coverHref, String tocHref, int totalChapters) {
+                               List<String> itemIds, String coverHref, String navHref, int totalChapters) {
         var sb = new StringBuilder();
         sb.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-        sb.append("<package xmlns=\"http://www.idpf.org/2007/opf\" version=\"2.0\" unique-identifier=\"BookId\">\n");
-        sb.append("  <metadata>\n");
+        sb.append("<package xmlns=\"http://www.idpf.org/2007/opf\" version=\"3.0\" unique-identifier=\"BookId\">\n");
+        sb.append("  <metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\">\n");
         sb.append("    <dc:identifier id=\"BookId\">").append(xmlEscape(bookId)).append("</dc:identifier>\n");
         sb.append("    <dc:title>").append(xmlEscape(bookName)).append("</dc:title>\n");
         sb.append("    <dc:language>zh</dc:language>\n");
-        if (coverHref != null) sb.append("    <meta name=\"cover\" content=\"cover-image\"/>\n");
+        if (coverHref != null) {
+            sb.append("    <meta name=\"cover\" content=\"cover-image\"/>\n");
+            sb.append("    <meta property=\"rendition:cover-image\" content=\"cover-image\"/>\n");
+        }
+        sb.append("    <meta property=\"dcterms:modified\">").append(Instant.now().toString()).append("</meta>\n");
         sb.append("  </metadata>\n");
         sb.append("  <manifest>\n");
         sb.append("    <item id=\"ncx\" href=\"toc.ncx\" media-type=\"application/x-dtbncx+xml\"/>\n");
         sb.append("    <item id=\"css\" href=\"stylesheet.css\" media-type=\"text/css\"/>\n");
         if (coverHref != null)
             sb.append("    <item id=\"cover\" href=\"").append(coverHref).append("\" media-type=\"application/xhtml+xml\"/>\n");
-        if (tocHref != null)
-            sb.append("    <item id=\"toc\" href=\"").append(tocHref).append("\" media-type=\"application/xhtml+xml\"/>\n");
+        if (navHref != null)
+            sb.append("    <item id=\"nav\" href=\"").append(navHref).append("\" media-type=\"application/xhtml+xml\" properties=\"nav\"/>\n");
         for (int i = 0; i < totalChapters; i++)
             sb.append("    <item id=\"ch_").append(String.format("%05d", i + 1))
               .append("\" href=\"").append(itemIds.get(i)).append("\" media-type=\"application/xhtml+xml\"/>\n");
         int imgIdx = 0;
         for (var entry : imageCache.entrySet()) {
             var info = entry.getValue();
-            var id = entry.getKey().equals("__cover__") ? "cover-image" : String.format("img_%04d", imgIdx++);
+            var isCover = entry.getKey().equals("__cover__");
+            var id = isCover ? "cover-image" : String.format("img_%04d", imgIdx++);
             sb.append("    <item id=\"").append(id).append("\" href=\"").append(info.filename())
-              .append("\" media-type=\"").append(info.mime()).append("\"/>\n");
+              .append("\" media-type=\"").append(info.mime()).append("\"")
+              .append(isCover ? " properties=\"cover-image\"" : "")
+              .append("/>\n");
         }
         sb.append("  </manifest>\n");
-        sb.append("  <spine toc=\"ncx\">\n");
+        sb.append("  <spine page-progression-direction=\"ltr\" toc=\"ncx\">\n");
         if (coverHref != null) sb.append("    <itemref idref=\"cover\"/>\n");
-        if (tocHref != null) sb.append("    <itemref idref=\"toc\"/>\n");
+        if (navHref != null) sb.append("    <itemref idref=\"nav\"/>\n");
         for (int i = 0; i < totalChapters; i++)
             sb.append("    <itemref idref=\"ch_").append(String.format("%05d", i + 1)).append("\"/>\n");
         sb.append("  </spine>\n</package>\n");
@@ -730,7 +739,7 @@ public class Main {
                                List<String> itemIds, int totalChapters) {
         var sb = new StringBuilder();
         sb.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-        sb.append("<!DOCTYPE ncx PUBLIC \"-//NISO//DTD ncx 2005-1//EN\" \"http://www.dtd.org/NISO/2005/DTD/ncx-2005-1.dtd\">\n");
+        sb.append("<!DOCTYPE ncx PUBLIC \"-//NISO//DTD ncx 2005-1//EN\" \"http://www.daisy.org/z3986/2005/ncx-2005-1.dtd\">\n");
         sb.append("<ncx xmlns=\"http://www.daisy.org/z3986/2005/ncx/\" version=\"2005-1\">\n");
         sb.append("  <head>\n");
         sb.append("    <meta name=\"dtb:uid\" content=\"").append(xmlEscape(bookId)).append("\"/>\n");
@@ -766,13 +775,13 @@ public class Main {
         return "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
              + "<!DOCTYPE html>\n"
              + "<html xmlns=\"http://www.w3.org/1999/xhtml\" lang=\"zh\" xml:lang=\"zh\">\n"
-             + "<head><title>" + escapedTitle + "</title>\n"
+             + "<head><meta charset=\"utf-8\"/><title>" + escapedTitle + "</title>\n"
              + "<link href=\"stylesheet.css\" rel=\"stylesheet\" type=\"text/css\"/></head>\n"
              + "<body>\n<h1>" + escapedTitle + "</h1>\n<div class=\"content\">\n"
              + wrapped + "\n</div>\n</body>\n</html>\n";
     }
 
-    static String buildTocXhtml(String bookName, List<Chapter> chapters, int totalChapters) {
+    static String buildNavXhtml(String bookName, List<Chapter> chapters, int totalChapters) {
         var ol = new StringBuilder();
         for (int i = 0; i < totalChapters; i++) {
             var ch = i < chapters.size() ? chapters.get(i) : null;
@@ -782,10 +791,15 @@ public class Main {
         }
         return "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
              + "<!DOCTYPE html>\n"
-             + "<html xmlns=\"http://www.w3.org/1999/xhtml\" lang=\"zh\" xml:lang=\"zh\">\n"
-             + "<head><title>" + xmlEscape(bookName) + " - 目录</title>\n"
+             + "<html xmlns=\"http://www.w3.org/1999/xhtml\" xmlns:epub=\"http://www.idpf.org/2007/ops\" lang=\"zh\" xml:lang=\"zh\">\n"
+             + "<head><meta charset=\"utf-8\"/><title>" + xmlEscape(bookName) + "</title>\n"
              + "<link href=\"stylesheet.css\" rel=\"stylesheet\" type=\"text/css\"/></head>\n"
-             + "<body>\n<h1>目录</h1>\n<div class=\"content\">\n<ol>\n" + ol + "</ol>\n</div>\n</body>\n</html>\n";
+             + "<body>\n"
+             + "<nav epub:type=\"toc\" id=\"toc\">\n"
+             + "  <h1 id=\"toc-title\">" + xmlEscape(bookName) + "</h1>\n"
+             + "  <ol>\n" + ol + "  </ol>\n"
+             + "</nav>\n"
+             + "</body>\n</html>\n";
     }
 
     static String buildCoverXhtml(String bookName, String imagePath) {
